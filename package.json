@@ -1,0 +1,27 @@
+{
+  "name": "poster-creator",
+  "version": "1.0.0",
+  "description": "Configurable multi-screen poster wall with template-driven exact-size PNG/JPG export.",
+  "scripts": {
+    "dev": "node scripts/server-dev.mjs",
+    "export": "node scripts/export.mjs",
+    "send:dry": "node scripts/send.mjs --dry-run",
+    "send": "node scripts/send.mjs",
+    "render-send:dry": "node scripts/render-and-send.mjs --dry-run",
+    "render-send": "node scripts/render-and-send.mjs"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "@weejewel/samsung-emdx": "^1.0.1",
+    "better-sqlite3": "^12.8.0",
+    "dotenv": "^17.4.0",
+    "express": "^5.2.1",
+    "node-vibrant": "^4.0.4",
+    "pixelmatch": "^7.1.0",
+    "playwright": "^1.54.0",
+    "pngjs": "^7.0.0"
+  }
+}

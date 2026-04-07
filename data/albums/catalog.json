@@ -1,0 +1,20 @@
+[
+  {
+    "slug": "ten",
+    "artist": "Pearl Jam",
+    "album": "Ten",
+    "year": 1991
+  },
+  {
+    "slug": "daisy",
+    "artist": "Brand New",
+    "album": "Daisy",
+    "year": 2009
+  },
+  {
+    "slug": "longform",
+    "artist": "The World Is a Beautiful Place & I Am No Longer Afraid to Die",
+    "album": "Whenever, If Ever",
+    "year": 2013
+  }
+]

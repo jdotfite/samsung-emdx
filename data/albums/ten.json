@@ -1,0 +1,24 @@
+{
+  "artist": "Pearl Jam",
+  "album": "Ten",
+  "year": 1991,
+  "label": "Epic Records",
+  "artistLabel": "Artist",
+  "cover": "/assets/covers/ten-cover.png",
+  "palette": ["#4a4b23", "#020100", "#bfc9aa", "#241f0b", "#706b4d"],
+  "format": "LP / Cassette / CD",
+  "footer": "Reference poster study",
+  "tracks": [
+    { "title": "Once", "length": "3:51" },
+    { "title": "Even Flow", "length": "4:53" },
+    { "title": "Alive", "length": "5:41" },
+    { "title": "Why Go", "length": "3:19" },
+    { "title": "Black", "length": "5:43" },
+    { "title": "Jeremy", "length": "5:18" },
+    { "title": "Oceans", "length": "2:41" },
+    { "title": "Porch", "length": "3:30" },
+    { "title": "Garden", "length": "4:58" },
+    { "title": "Deep", "length": "4:18" },
+    { "title": "Release", "length": "9:05" }
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "artist": "Brand New",
+  "album": "Daisy",
+  "year": 2009,
+  "label": "DGC Records",
+  "artistLabel": "Artist",
+  "cover": "/assets/covers/daisy-cover.png",
+  "palette": ["#e0dfe0", "#545357", "#241b1a", "#3e373c", "#87846f"],
+  "format": "LP / CD / Digital",
+  "footer": "Reference poster study",
+  "tracks": [
+    { "title": "Vices", "length": "3:22" },
+    { "title": "Bed", "length": "3:10" },
+    { "title": "At the Bottom", "length": "4:59" },
+    { "title": "Gasoline", "length": "3:23" },
+    { "title": "You Stole", "length": "4:18" },
+    { "title": "Be Gone", "length": "2:33" },
+    { "title": "Sink", "length": "5:08" },
+    { "title": "Bought a Bride", "length": "4:52" },
+    { "title": "Daisy", "length": "3:07" },
+    { "title": "In a Jar", "length": "3:50" },
+    { "title": "Noro", "length": "6:32" }
+  ]
+}

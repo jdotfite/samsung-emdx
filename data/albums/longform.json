@@ -1,0 +1,22 @@
+{
+  "artist": "The World Is a Beautiful Place & I Am No Longer Afraid to Die",
+  "album": "Whenever, If Ever",
+  "year": 2013,
+  "label": "Topshelf Records",
+  "artistLabel": "Stress Test",
+  "cover": "/assets/covers/daisy-cover.png",
+  "palette": ["#dad7c7", "#524a4d", "#7f7155", "#1f1c20", "#b8baa7"],
+  "format": "LP / Digital",
+  "footer": "Layout resilience fixture",
+  "tracks": [
+    { "title": "Blank #9", "length": "2:53" },
+    { "title": "Heartbeat in the Brain", "length": "7:04" },
+    { "title": "Gig Life", "length": "4:20" },
+    { "title": "Getting Sodas", "length": "5:22" },
+    { "title": "Everything I Own Has Been Taken Back by the Kids", "length": "5:44" },
+    { "title": "Gig Life (Reprise)", "length": "1:39" },
+    { "title": "I Can Be Afraid of Anything", "length": "6:42" },
+    { "title": "Mount Hum", "length": "4:57" },
+    { "title": "Picture of a Tree That Doesn't Look Okay", "length": "4:13" }
+  ]
+}

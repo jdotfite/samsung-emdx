@@ -1,0 +1,8 @@
+.env
+node_modules/
+data/poster-wall.db
+data/poster-wall.db-*
+assets/covers/imported/
+output/
+server.out
+server.err
