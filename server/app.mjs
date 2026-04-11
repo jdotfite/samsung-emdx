@@ -1,11 +1,13 @@
 import express from "express";
 import path from "node:path";
 import fs from "node:fs";
+import sharp from "sharp";
 import { env } from "./env.mjs";
 import { deleteImportedAlbums, listAllCatalogEntries, loadAlbumBySlug } from "./album-store.mjs";
 import { loadDeviceStateFromStore, recordSentImages } from "./device-state-store.mjs";
 import { loadProjectFromStore, saveProjectToStore } from "./project-store.mjs";
-import { getArtistAlbums, getPlaylistAlbums, parseSpotifyId, searchArtists } from "./spotify-client.mjs";
+import { applyEditRecipe, normalizeEditRecipe, writeEditCache } from "../scripts/lib/image-edit-service.mjs";
+import { getArtistAlbumsPage, getPlaylistAlbums, parseSpotifyId, searchAlbums, searchArtists } from "./spotify-client.mjs";
 import { importSpotifyAlbum } from "./spotify-importer.mjs";
 import { loadSpotifySettingsFromStore, saveSpotifySettingsToStore } from "./spotify-settings-store.mjs";
 import { getDb } from "./db.mjs";
@@ -28,7 +30,41 @@ import { DEFAULT_PROJECT } from "../src/default-project.js";
 
 const rootDir = process.cwd();
 const outputDir = path.join(rootDir, "output");
+const editCacheDir = path.join(outputDir, ".edit-cache");
 const outputImagePattern = /\.(png|jpe?g|webp)$/i;
+
+function orientationFromRatio(ratio) {
+  if (!Number.isFinite(ratio) || ratio <= 0) {
+    return null;
+  }
+  if (Math.abs(ratio - 1) < 0.02) {
+    return "square";
+  }
+  return ratio > 1 ? "landscape" : "portrait";
+}
+
+async function probeImage(filePath) {
+  try {
+    const metadata = await sharp(filePath).metadata();
+    const rotated = metadata.orientation && metadata.orientation >= 5 && metadata.orientation <= 8;
+    const width = rotated ? metadata.height : metadata.width;
+    const height = rotated ? metadata.width : metadata.height;
+    if (!width || !height) {
+      return { width: null, height: null, aspectRatio: null, orientation: null, format: metadata.format || null };
+    }
+    const aspectRatio = Math.round((width / height) * 1000) / 1000;
+    return {
+      width,
+      height,
+      aspectRatio,
+      orientation: orientationFromRatio(aspectRatio),
+      format: metadata.format || null
+    };
+  } catch (error) {
+    console.warn(`[image-probe] failed to read ${path.basename(filePath)}: ${error.message}`);
+    return { width: null, height: null, aspectRatio: null, orientation: null, format: null };
+  }
+}
 
 function sanitizeUploadFileName(fileName = "upload") {
   const parsed = path.parse(fileName);
@@ -64,18 +100,41 @@ async function listOutputImages() {
       .filter((entry) => entry.isFile() && outputImagePattern.test(entry.name) && !/^ui-/i.test(entry.name))
       .map(async (entry) => {
         const filePath = path.join(outputDir, entry.name);
-        const stats = await fs.promises.stat(filePath);
+        const [stats, dimensions] = await Promise.all([
+          fs.promises.stat(filePath),
+          probeImage(filePath)
+        ]);
         return {
           name: entry.name,
           url: `/output/${entry.name}`,
           size: stats.size,
-          modifiedAt: stats.mtime.toISOString()
+          modifiedAt: stats.mtime.toISOString(),
+          width: dimensions.width,
+          height: dimensions.height,
+          aspectRatio: dimensions.aspectRatio,
+          orientation: dimensions.orientation,
+          format: dimensions.format
         };
       }),
   );
 
   images.sort((a, b) => new Date(b.modifiedAt).getTime() - new Date(a.modifiedAt).getTime());
   return images;
+}
+
+function editCachePathFor(imageName) {
+  return path.join(editCacheDir, imageName);
+}
+
+async function removeEditCache(imageName) {
+  const cachePath = editCachePathFor(imageName);
+  try {
+    await fs.promises.unlink(cachePath);
+  } catch (error) {
+    if (error.code !== "ENOENT") {
+      throw error;
+    }
+  }
 }
 
 function findScreenById(screenId) {
@@ -295,6 +354,101 @@ export async function startAppServer({ host = env.appHost, port = env.appPort } 
     }
   });
 
+  app.put("/api/content/items/:imageName/edit", async (req, res) => {
+    try {
+      const imageName = String(req.params.imageName || "").trim();
+      if (!imageName || path.basename(imageName) !== imageName) {
+        res.status(400).json({ error: "Invalid image name." });
+        return;
+      }
+
+      const sourcePath = path.resolve(outputDir, imageName);
+      if (!sourcePath.startsWith(path.resolve(outputDir) + path.sep)) {
+        res.status(400).json({ error: "Invalid image path." });
+        return;
+      }
+      await fs.promises.access(sourcePath, fs.constants.R_OK);
+
+      const rawRecipe = req.body?.editRecipe || null;
+      const saveAsCopy = Boolean(req.body?.saveAsCopy);
+      const normalized = normalizeEditRecipe(rawRecipe);
+
+      const project = loadProjectFromStore();
+      const targetScreen = normalized?.targetScreenId
+        ? project.screens.find((screen) => screen.id === normalized.targetScreenId)
+        : null;
+      const targetWidth = targetScreen?.size?.width || null;
+      const targetHeight = targetScreen?.size?.height || null;
+
+      if (saveAsCopy) {
+        if (!normalized) {
+          res.status(400).json({ error: "No edits to apply." });
+          return;
+        }
+        const buffer = await applyEditRecipe(sourcePath, normalized, {
+          targetWidth,
+          targetHeight,
+          outputFormat: path.extname(imageName).slice(1)
+        });
+        const parsed = path.parse(imageName);
+        const stamp = Date.now();
+        const copyName = `${parsed.name}-edit-${stamp}${parsed.ext || ".png"}`;
+        const copyPath = path.join(outputDir, copyName);
+        await fs.promises.mkdir(outputDir, { recursive: true });
+        await fs.promises.writeFile(copyPath, buffer);
+        const images = await listOutputImages();
+        const copy = images.find((image) => image.name === copyName);
+        res.json({ ok: true, savedAsCopy: true, image: copy });
+        return;
+      }
+
+      project.contentLibrary = project.contentLibrary || { collections: [], sets: [], items: {} };
+      project.contentLibrary.items = project.contentLibrary.items || {};
+      const existing = project.contentLibrary.items[imageName] || { tags: [], collectionIds: [] };
+      project.contentLibrary.items[imageName] = {
+        tags: Array.isArray(existing.tags) ? existing.tags : [],
+        collectionIds: Array.isArray(existing.collectionIds) ? existing.collectionIds : [],
+        editRecipe: normalized
+      };
+      saveProjectToStore(project);
+
+      if (normalized) {
+        const buffer = await applyEditRecipe(sourcePath, normalized, {
+          targetWidth,
+          targetHeight,
+          outputFormat: path.extname(imageName).slice(1)
+        });
+        await writeEditCache(editCachePathFor(imageName), buffer);
+      } else {
+        await removeEditCache(imageName);
+      }
+
+      res.json({ ok: true, editRecipe: normalized });
+    } catch (error) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.delete("/api/content/items/:imageName/edit", async (req, res) => {
+    try {
+      const imageName = String(req.params.imageName || "").trim();
+      if (!imageName || path.basename(imageName) !== imageName) {
+        res.status(400).json({ error: "Invalid image name." });
+        return;
+      }
+      const project = loadProjectFromStore();
+      const item = project.contentLibrary?.items?.[imageName];
+      if (item) {
+        item.editRecipe = null;
+        saveProjectToStore(project);
+      }
+      await removeEditCache(imageName);
+      res.json({ ok: true });
+    } catch (error) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
   app.post("/api/content/send", async (req, res) => {
     try {
       const imageName = String(req.body.imageName || "").trim();
@@ -310,15 +464,37 @@ export async function startAppServer({ host = env.appHost, port = env.appPort } 
         return;
       }
 
-      const imagePath = path.resolve(outputDir, imageName);
-      if (!imagePath.startsWith(path.resolve(outputDir) + path.sep)) {
+      const sourcePath = path.resolve(outputDir, imageName);
+      if (!sourcePath.startsWith(path.resolve(outputDir) + path.sep)) {
         res.status(400).json({ error: "Invalid image path." });
         return;
       }
 
-      await fs.promises.access(imagePath, fs.constants.R_OK);
+      await fs.promises.access(sourcePath, fs.constants.R_OK);
 
       const project = loadProjectFromStore();
+
+      let imagePath = sourcePath;
+      const editRecipe = project.contentLibrary?.items?.[imageName]?.editRecipe || null;
+      if (editRecipe) {
+        const cachePath = editCachePathFor(imageName);
+        try {
+          await fs.promises.access(cachePath, fs.constants.R_OK);
+          imagePath = cachePath;
+        } catch {
+          const targetScreen = editRecipe.targetScreenId
+            ? project.screens.find((screen) => screen.id === editRecipe.targetScreenId)
+            : null;
+          const buffer = await applyEditRecipe(sourcePath, editRecipe, {
+            targetWidth: targetScreen?.size?.width || null,
+            targetHeight: targetScreen?.size?.height || null,
+            outputFormat: path.extname(imageName).slice(1)
+          });
+          await writeEditCache(cachePath, buffer);
+          imagePath = cachePath;
+        }
+      }
+
       const screens = project.screens.filter((screen) => requestedIds.includes(screen.id) && screen.enabled);
       const missing = requestedIds.filter((id) => !screens.some((screen) => screen.id === id));
 
@@ -353,7 +529,14 @@ export async function startAppServer({ host = env.appHost, port = env.appPort } 
             completeSendJobTarget(job.id, result.screenId, result);
           }
           recordSentImages(results);
-          finishSendJob(job.id);
+
+          const finalJob = getSendJob(job.id);
+          const hasUnverified = finalJob?.targets.some((t) => t.status === "unverified");
+          if (hasUnverified) {
+            failSendJob(job.id, "One or more frames did not confirm image receipt. Try waking the display and sending again.");
+          } else {
+            finishSendJob(job.id);
+          }
         } catch (error) {
           failSendJob(job.id, error.message || "Send failed.");
         }
@@ -370,26 +553,47 @@ export async function startAppServer({ host = env.appHost, port = env.appPort } 
   });
 
   app.get("/api/spotify/search/artists", async (req, res) => {
-    try {
-      const query = String(req.query.q || "").trim();
-      if (!query) {
-        res.json([]);
+      try {
+        const query = String(req.query.q || "").trim();
+        if (!query) {
+          res.json([]);
         return;
       }
       res.json(await searchArtists(query));
     } catch (error) {
-      res.status(500).json({ error: error.message });
-    }
-  });
+        res.status(500).json({ error: error.message });
+      }
+    });
+
+  app.get("/api/spotify/search/albums", async (req, res) => {
+      try {
+        const query = String(req.query.q || "").trim();
+        if (!query) {
+          res.json([]);
+          return;
+        }
+        res.json(await searchAlbums(query));
+      } catch (error) {
+        console.error("[spotify] album search error:", error.message);
+        res.status(500).json({ error: error.message });
+      }
+    });
 
   app.get("/api/spotify/artists/:artistId/albums", async (req, res) => {
-    try {
-      const albums = await getArtistAlbums(req.params.artistId);
-      res.json(albums);
-    } catch (error) {
-      res.status(500).json({ error: error.message });
-    }
-  });
+      try {
+        const filter = String(req.query.filter || "album").trim() || "album";
+        const offset = Math.max(0, Number.parseInt(String(req.query.offset || "0"), 10) || 0);
+        const albums = await getArtistAlbumsPage(req.params.artistId, {
+          filter,
+          offset,
+          limit: 10
+        });
+        res.json(albums);
+      } catch (error) {
+        console.error("[spotify] artist albums error:", error.message);
+        res.status(500).json({ error: error.message });
+      }
+    });
 
   app.get("/api/spotify/playlists/:playlistId/albums", async (req, res) => {
     try {

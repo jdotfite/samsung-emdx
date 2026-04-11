@@ -90,29 +90,61 @@ export function recordSendJobEvent(jobId, screenId, event) {
         target.milestones.wakeSent = true;
         job.stage = "waking";
         break;
+      case "mdc_verify_start":
+      case "mdc_verify_ok":
+      case "mdc_verify_fail":
+      case "mdc_settle_wait":
+        target.stage = "verifying_mdc";
+        job.stage = "verifying_mdc";
+        break;
+      case "wake_settle":
+        target.stage = "wake_settling";
+        job.stage = "waking";
+        break;
+      case "http_server_start":
+      case "http_server_ready":
+        target.stage = "preparing_server";
+        job.stage = "preparing";
+        break;
+      case "connecting_start":
+        target.stage = "connecting";
+        job.stage = "sending";
+        break;
       case "connected":
         target.stage = "connected";
         target.milestones.connected = true;
         job.stage = "sending";
         break;
+      case "setting_content":
       case "content_set":
         target.stage = "commanded";
         target.milestones.contentSet = true;
         job.stage = "sending";
         break;
+      case "content_json_requested":
       case "content_json_served":
         target.stage = "frame_fetching";
         target.milestones.contentJsonFetched = true;
         job.stage = "verifying";
         break;
+      case "image_requested":
       case "image_served":
         target.stage = "image_verified";
         target.milestones.imageFetched = true;
         job.stage = "verifying";
         break;
+      case "linger_start":
+        target.stage = "lingering";
+        job.stage = "verifying";
+        break;
       case "attempt_retry":
         target.stage = "retrying";
         job.stage = "sending";
+        break;
+      case "unverified":
+        target.stage = "unverified";
+        target.status = "unverified";
+        target.error = normalized.message || "Frame did not confirm receipt.";
         break;
       case "failed":
         target.stage = "failed";
@@ -134,9 +166,22 @@ export function completeSendJobTarget(jobId, screenId, result) {
     if (!target) {
       return;
     }
-    target.status = "completed";
-    target.stage = target.milestones.imageFetched ? "image_verified" : "completed";
-    target.delivery = result.delivery || null;
+    const imageVerified = target.milestones.imageFetched;
+    target.status = imageVerified ? "completed" : "unverified";
+    target.stage = imageVerified ? "image_verified" : "unverified";
+    if (!imageVerified) {
+      target.error = target.error || "Frame did not confirm image receipt.";
+    }
+    target.delivery = result.delivery
+      ? {
+          woke: Boolean(result.delivery.woke),
+          retried: Boolean(result.delivery.retried),
+          verified: result.delivery.verified || {
+            contentJsonFetched: false,
+            imageFetched: false
+          }
+        }
+      : null;
   });
 }
 

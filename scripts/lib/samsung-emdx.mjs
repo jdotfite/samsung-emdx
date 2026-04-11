@@ -1,5 +1,9 @@
 import path from "node:path";
-import { spawn } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import crypto from "node:crypto";
+import express from "express";
+import { Device } from "@weejewel/samsung-mdc";
 import { env } from "../../server/env.mjs";
 
 export function getSamsungEmdxBin(cwd = process.cwd()) {
@@ -33,141 +37,167 @@ export function buildSamsungArgs({ imagePath, device }) {
   return args;
 }
 
-function parseSamsungLine(line) {
-  if (!line) {
-    return null;
+function detectLanIp() {
+  const interfaces = os.networkInterfaces();
+  for (const name of Object.keys(interfaces)) {
+    for (const iface of interfaces[name]) {
+      if (iface.family === "IPv4" && !iface.internal) {
+        return iface.address;
+      }
+    }
   }
-
-  if (line.includes("Starting HTTP server")) {
-    return { type: "http_server_start", message: line };
-  }
-  if (line.includes("HTTP server listening")) {
-    return { type: "http_server_ready", message: line };
-  }
-  if (line.includes("Waking up device")) {
-    return { type: "waking_start", message: line };
-  }
-  if (line.includes("Device woken up")) {
-    return { type: "wake_done", message: line };
-  }
-  if (line.includes("Connecting")) {
-    return { type: "connecting_start", message: line };
-  }
-  if (line.includes("Connected")) {
-    return { type: "connected", message: line };
-  }
-  if (line.includes("Setting content to")) {
-    return { type: "setting_content", message: line };
-  }
-  if (line.includes("Content set")) {
-    return { type: "content_set", message: line };
-  }
-  if (line.includes("Serving /content.json")) {
-    return { type: "content_json_requested", message: line };
-  }
-  if (line.includes("Served /content.json")) {
-    return { type: "content_json_served", message: line };
-  }
-  if (line.includes("Serving /image")) {
-    return { type: "image_requested", message: line };
-  }
-  if (line.includes("Served /image")) {
-    return { type: "image_served", message: line };
-  }
-
-  return { type: "log", message: line };
+  return "127.0.0.1";
 }
 
-export async function sendImageToSamsungDisplay({ imagePath, device, cwd = process.cwd(), timeoutMs = 45000, onEvent }) {
-  const binPath = getSamsungEmdxBin(cwd);
-  const args = [binPath, ...buildSamsungArgs({ imagePath, device })];
+function getLocalIp(device) {
+  return device.localIp || env.defaultLocalIp || detectLanIp();
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function withTimeout(promise, ms, label = "Operation") {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)
+    )
+  ]);
+}
+
+/**
+ * In-process EMDX sender. Hosts a local HTTP server, connects via MDC,
+ * issues setContentDownload, waits for the frame to fetch the image,
+ * then lingers for a configurable period before shutting down.
+ */
+export async function sendImageToSamsungDisplay({
+  imagePath,
+  device,
+  onEvent,
+  lingerMs = 12000,
+  fetchTimeoutMs = 15000
+}) {
+  const events = [];
   const rawLines = [];
-  const parsedEvents = [];
+  let contentJsonFetched = false;
+  let imageFetched = false;
 
-  await new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, args, {
-      cwd,
-      stdio: ["ignore", "pipe", "pipe"]
-    });
-    let settled = false;
+  const pushEvent = (type, message) => {
+    const event = { type, message, at: new Date().toISOString() };
+    events.push(event);
+    rawLines.push(message);
+    onEvent?.(event);
+  };
 
-    const finishReject = (error) => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      error.events = parsedEvents;
-      error.rawLines = rawLines;
-      reject(error);
-    };
+  const localIp = getLocalIp(device);
+  const fileId = crypto.randomUUID().toUpperCase();
+  const fileSize = fs.statSync(imagePath).size;
+  const fileExtension = path.extname(imagePath).slice(1) || "png";
+  const fileName = `${fileId}.${fileExtension}`;
 
-    const finishResolve = () => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      resolve();
-    };
+  // Start local HTTP server
+  pushEvent("http_server_start", "Starting local HTTP server for frame fetch.");
 
-    const emitLine = (line) => {
-      const trimmed = String(line || "").trim();
-      if (!trimmed) {
-        return;
-      }
-      rawLines.push(trimmed);
-      const parsed = parseSamsungLine(trimmed);
-      if (!parsed) {
-        return;
-      }
-      const event = {
-        ...parsed,
-        at: new Date().toISOString()
-      };
-      parsedEvents.push(event);
-      onEvent?.(event);
-    };
+  let serverPort = 0;
 
-    const bindStream = (stream) => {
-      let buffer = "";
-      stream.setEncoding("utf8");
-      stream.on("data", (chunk) => {
-        buffer += chunk;
-        const lines = buffer.split(/\r?\n/);
-        buffer = lines.pop() || "";
-        lines.forEach(emitLine);
+  const { server, port } = await new Promise((resolve, reject) => {
+    const app = express();
+
+    app.get("/content.json", (req, res) => {
+      pushEvent("content_json_requested", "Serving /content.json to frame.");
+      res.header("Content-Type", "application/json");
+      res.send(
+        JSON.stringify({
+          schedule: [
+            {
+              start_date: "1970-01-01",
+              stop_date: "2999-12-31",
+              start_time: "00:00:00",
+              contents: [
+                {
+                  image_url: `http://${localIp}:${serverPort}/image`,
+                  file_id: fileId,
+                  file_path: `/home/owner/content/Downloads/vxtplayer/epaper/mobile/contents/${fileId}/${fileName}`,
+                  duration: 91326,
+                  file_size: `${fileSize}`,
+                  file_name: fileName
+                }
+              ]
+            }
+          ],
+          name: "node-samsung-emdx",
+          version: 1,
+          create_time: "2025-01-01 00:00:00",
+          id: fileId,
+          program_id: "com.samsung.ios.ePaper",
+          content_type: "ImageContent",
+          deploy_type: "MOBILE"
+        }).replaceAll("/", "\\/"),
+      );
+
+      req.once("close", () => {
+        contentJsonFetched = true;
+        pushEvent("content_json_served", "Served /content.json to frame.");
       });
-      stream.on("end", () => {
-        if (buffer.trim()) {
-          emitLine(buffer);
+    });
+
+    app.get("/image", (req, res) => {
+      pushEvent("image_requested", `Serving /image (${fileSize} bytes) to frame.`);
+      res.type(fileExtension === "jpg" || fileExtension === "jpeg" ? "image/jpeg" : "image/png");
+      res.sendFile(path.resolve(imagePath), (err) => {
+        if (err) {
+          pushEvent("image_serve_error", `Failed to serve image: ${err.message}`);
+        } else {
+          imageFetched = true;
+          pushEvent("image_served", "Frame finished fetching the image.");
         }
       });
-    };
-
-    bindStream(child.stdout);
-    bindStream(child.stderr);
-
-    const timeout = setTimeout(() => {
-      child.kill();
-      finishReject(new Error(`Samsung EMDX sender timed out after ${timeoutMs}ms`));
-    }, timeoutMs);
-
-    child.on("error", reject);
-    child.on("exit", (code) => {
-      clearTimeout(timeout);
-      if (code === 0) {
-        finishResolve();
-        return;
-      }
-      finishReject(new Error(`Samsung EMDX sender exited with code ${code}`));
     });
+
+    const listener = app.listen(0, () => {
+      serverPort = listener.address().port;
+      resolve({ server: listener, port: serverPort });
+    });
+    listener.on("error", reject);
   });
 
+  pushEvent("http_server_ready", `HTTP server listening at http://${localIp}:${port}`);
+
+  try {
+    // MDC connect and set content
+    pushEvent("connecting_start", `Connecting to ${device.host}:1515 via MDC.`);
+    const mdc = new Device({ host: device.host, pin: device.pin, mac: device.mac });
+    await withTimeout(mdc.connect(), 10000, "MDC connect");
+    pushEvent("connected", "MDC connection established.");
+
+    const contentUrl = `http://${localIp}:${port}/content.json`;
+    pushEvent("setting_content", `Setting content download URL: ${contentUrl}`);
+    await withTimeout(mdc.setContentDownload({ url: contentUrl }), 10000, "setContentDownload");
+    await mdc.disconnect().catch(() => {});
+    pushEvent("content_set", "Content download URL set on frame.");
+
+    // Wait for the frame to fetch the image
+    const fetchStart = Date.now();
+    while (!imageFetched && Date.now() - fetchStart < fetchTimeoutMs) {
+      await sleep(300);
+    }
+
+    // Linger so the frame can re-request if needed
+    if (imageFetched && lingerMs > 0) {
+      pushEvent("linger_start", `Image fetched. Keeping server alive for ${Math.round(lingerMs / 1000)}s in case frame re-requests.`);
+      await sleep(lingerMs);
+    }
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+
   return {
-    events: parsedEvents,
+    events,
     rawLines,
     verified: {
-      contentJsonFetched: parsedEvents.some((event) => event.type === "content_json_served"),
-      imageFetched: parsedEvents.some((event) => event.type === "image_served")
+      contentJsonFetched,
+      imageFetched
     }
   };
 }

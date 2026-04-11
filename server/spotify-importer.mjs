@@ -43,6 +43,19 @@ async function extractPalette(filePath) {
   }
 }
 
+function extractLabel(album) {
+  // Prefer copyrights for richer label info (e.g. "Atlantic Records, Never Broke Again & Quando Rondo, LLC")
+  const copyrights = album.copyrights || [];
+  const phonographic = copyrights.find((c) => c.type === "P");
+  const general = copyrights.find((c) => c.type === "C") || copyrights[0];
+  const raw = (phonographic || general)?.text || "";
+  // Strip leading year and (P)/(C) markers: "2021 Atlantic Records" → "Atlantic Records"
+  const cleaned = raw.replace(/^[©℗(PC)\s\d]+/i, "").trim();
+  if (cleaned) return cleaned;
+  // Fall back to Spotify's label field
+  return album.label || "";
+}
+
 function normalizeAlbumPayload(album, coverPath, palette) {
   const primaryArtist = album.artists?.[0]?.name || "Unknown Artist";
   const year = Number(String(album.release_date || "").slice(0, 4)) || null;
@@ -56,7 +69,8 @@ function normalizeAlbumPayload(album, coverPath, palette) {
     artist: primaryArtist,
     album: album.name,
     year,
-    label: album.label || "Spotify",
+    releaseDate: album.release_date || "",
+    label: extractLabel(album),
     artistLabel: "Artist",
     cover: coverPath,
     palette,

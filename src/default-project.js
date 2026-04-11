@@ -1,10 +1,26 @@
 export const DEFAULT_PROJECT = {
-  version: 2,
+  version: 4,
   name: "E-Ink Gallery",
+  rooms: [
+    { id: "living-room", name: "Living Room" }
+  ],
+  walls: [
+    { id: "living-room-living-room-wall", roomId: "living-room", name: "Living Room Wall" }
+  ],
+  contentLibrary: {
+    collections: [],
+    sets: [],
+    items: {}
+  },
   screens: [
     {
       id: "living-room-1",
       name: "Living Room 1",
+      roomId: "living-room",
+      roomName: "Living Room",
+      wallId: "living-room-living-room-wall",
+      wallName: "Living Room Wall",
+      wallSlot: "left",
       enabled: true,
       profile: "music",
       template: "music-editorial-v1",
@@ -23,6 +39,11 @@ export const DEFAULT_PROJECT = {
     {
       id: "living-room-2",
       name: "Living Room 2",
+      roomId: "living-room",
+      roomName: "Living Room",
+      wallId: "living-room-living-room-wall",
+      wallName: "Living Room Wall",
+      wallSlot: "center",
       enabled: true,
       profile: "music",
       template: "music-minimal-v1",
@@ -41,6 +62,11 @@ export const DEFAULT_PROJECT = {
     {
       id: "living-room-3",
       name: "Living Room 3",
+      roomId: "living-room",
+      roomName: "Living Room",
+      wallId: "living-room-living-room-wall",
+      wallName: "Living Room Wall",
+      wallSlot: "right",
       enabled: true,
       profile: "music",
       template: "music-editorial-v1",

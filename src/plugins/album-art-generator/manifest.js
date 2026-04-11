@@ -5,7 +5,7 @@ const albumArtGeneratorPlugin = {
   category: "Music Posters",
   status: "installed",
   version: "0.1.0",
-  mark: "AA",
+  icon: "music",
   accent: "#d1b78c",
   summary: "Generate e-ink-ready album posters from Spotify imports, playlists, and local cover art.",
   capabilities: ["Spotify artist search", "Playlist album import", "Exact portrait poster outputs"],

@@ -77,31 +77,57 @@ export async function probeDeviceHost(host, port = 1515, timeoutMs = 2500) {
   });
 }
 
+async function safeCommand(client, commandId, data = []) {
+  try {
+    return { ok: true, payload: await client.sendCommand({ commandId, data }) };
+  } catch {
+    return { ok: false, payload: null };
+  }
+}
+
+const SOURCE_NAMES = {
+  0x00: "Art Mode",
+  0x01: "TV",
+  0x02: "HDMI",
+  0x03: "HDMI 1",
+  0x04: "HDMI 2",
+  0x05: "USB",
+  0x09: "URL Launcher",
+  0x0A: "MagicInfo",
+  0x0B: "Screen Mirroring",
+  0x20: "Media Player",
+  0x21: "Signage Player"
+};
+
+function parseSourcePayload(payload) {
+  if (!payload || payload.length < 1) return null;
+  const code = payload[0];
+  return {
+    code,
+    label: SOURCE_NAMES[code] || `Unknown (0x${code.toString(16).padStart(2, "0")})`
+  };
+}
+
 export async function getDeviceStatus(deviceConfig) {
   const device = sanitizeDeviceConfig(deviceConfig);
   const probe = await probeDeviceHost(device.host);
 
+  const emptyResult = {
+    ...probe,
+    powerState: null,
+    deviceName: "",
+    serialNumber: "",
+    softwareVersion: "",
+    battery: null,
+    source: null
+  };
+
   if (!probe.reachable) {
-    return {
-      ...probe,
-      powerState: null,
-      deviceName: "",
-      serialNumber: "",
-      softwareVersion: "",
-      battery: null
-    };
+    return emptyResult;
   }
 
   if (!device.pin) {
-    return {
-      ...probe,
-      powerState: null,
-      deviceName: "",
-      serialNumber: "",
-      softwareVersion: "",
-      battery: null,
-      error: "Device PIN is not configured."
-    };
+    return { ...emptyResult, error: "Device PIN is not configured." };
   }
 
   const client = new Device({
@@ -112,33 +138,36 @@ export async function getDeviceStatus(deviceConfig) {
 
   try {
     await client.connect();
-    const powerStateResult = await Promise.allSettled([client.getPowerState()]);
-    const [deviceNameResult, serialResult, versionResult, batteryResult] = await Promise.allSettled([
+    const [powerStateResult, deviceNameResult, serialResult, versionResult, batteryResult, sourceResult] = await Promise.allSettled([
+      client.getPowerState(),
       client.getDeviceName(),
       client.getSerialNumber(),
       client.getSoftwareVersion(),
-      client.getBatteryState()
+      client.getBatteryState(),
+      client.sendCommand({ commandId: 0xB5 })
     ]);
 
-    const powerStateError = powerStateResult[0].status === "rejected" ? powerStateResult[0].reason : null;
-    const powerStateErrorMessage = powerStateError?.message === "NAK"
-      ? "Power state not exposed by this frame."
-      : powerStateError?.message || "";
+    const powerStateError = powerStateResult.status === "rejected" ? powerStateResult.reason : null;
+    const powerStateErrorMessage = powerStateError?.message && powerStateError.message !== "NAK"
+      ? powerStateError.message
+      : "";
 
     return {
       ...probe,
-      powerState: powerStateResult[0].status === "fulfilled" ? powerStateResult[0].value : "",
+      powerState: powerStateResult.status === "fulfilled" ? powerStateResult.value : "",
       mdcConnected: true,
       deviceName: deviceNameResult.status === "fulfilled" ? deviceNameResult.value : "",
       serialNumber: serialResult.status === "fulfilled" ? serialResult.value : "",
       softwareVersion: versionResult.status === "fulfilled" ? versionResult.value : "",
       battery: batteryResult.status === "fulfilled" ? batteryResult.value : null,
+      source: sourceResult.status === "fulfilled" ? parseSourcePayload(sourceResult.value) : null,
       error: powerStateErrorMessage
     };
   } finally {
     await client.disconnect().catch(() => {});
   }
 }
+
 
 export async function wakeDevice(deviceConfig) {
   const device = sanitizeDeviceConfig(deviceConfig);

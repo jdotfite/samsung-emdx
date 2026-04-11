@@ -14,6 +14,14 @@ export async function apiPutJson(url, body) {
   return parseJson(response);
 }
 
+export async function apiDeleteJson(url) {
+  const response = await fetch(url, {
+    method: "DELETE",
+    headers: { Accept: "application/json" }
+  });
+  return parseJson(response);
+}
+
 export async function apiPostJson(url, body) {
   const response = await fetch(url, {
     method: "POST",
