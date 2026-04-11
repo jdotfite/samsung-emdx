@@ -2007,6 +2007,21 @@ textarea {
   color: #fffdf8;
 }
 
+.content-meta-chip--warn {
+  background: rgba(180, 40, 40, 0.92);
+  color: #fffdf8;
+}
+
+.content-preview-warning {
+  margin: 8px 0 0;
+  padding: 8px 12px;
+  border-radius: 10px;
+  background: rgba(180, 40, 40, 0.1);
+  color: rgba(180, 40, 40, 0.95);
+  font-size: 12px;
+  max-width: 600px;
+}
+
 .content-meta-row {
   display: flex;
   gap: 6px;

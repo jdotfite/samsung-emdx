@@ -550,6 +550,75 @@ function getContentTargetScreens() {
   return state.project.screens.filter((screen) => screen.enabled && ids.includes(screen.id));
 }
 
+function getFitCheckTargetScreens() {
+  const selected = getContentTargetScreens();
+  if (selected.length) {
+    return selected;
+  }
+  return state.project.screens.filter((screen) => screen.enabled);
+}
+
+function screenOrientation(screen) {
+  const w = screen?.size?.width || 0;
+  const h = screen?.size?.height || 0;
+  if (!w || !h) return null;
+  if (Math.abs(w / h - 1) < 0.02) return "square";
+  return w > h ? "landscape" : "portrait";
+}
+
+function screenAspectRatio(screen) {
+  const w = screen?.size?.width || 0;
+  const h = screen?.size?.height || 0;
+  if (!w || !h) return null;
+  return Math.round((w / h) * 1000) / 1000;
+}
+
+function evaluateImageFit(image, targetScreens) {
+  if (!image.width || !image.height || !targetScreens?.length) {
+    return { status: "unknown", warnings: [] };
+  }
+  const imageOrientation = image.orientation;
+  const imageAspect = image.aspectRatio;
+  const mismatchedOrientation = [];
+  const mismatchedAspect = [];
+  let exactFit = false;
+
+  for (const screen of targetScreens) {
+    const targetOrientation = screenOrientation(screen);
+    const targetAspect = screenAspectRatio(screen);
+    if (!targetAspect) continue;
+
+    if (imageOrientation && targetOrientation && imageOrientation !== targetOrientation && imageOrientation !== "square") {
+      mismatchedOrientation.push(screen);
+      continue;
+    }
+    const aspectDelta = Math.abs(imageAspect - targetAspect) / targetAspect;
+    if (aspectDelta > 0.1) {
+      mismatchedAspect.push({ screen, delta: aspectDelta });
+    } else {
+      exactFit = true;
+    }
+  }
+
+  if (mismatchedOrientation.length) {
+    return {
+      status: "warn-orientation",
+      warnings: mismatchedOrientation,
+      label: "Wrong orientation",
+      title: `Image is ${imageOrientation}, target screen${mismatchedOrientation.length > 1 ? "s are" : " is"} ${screenOrientation(mismatchedOrientation[0])}.`
+    };
+  }
+  if (mismatchedAspect.length && !exactFit) {
+    return {
+      status: "warn-aspect",
+      warnings: mismatchedAspect,
+      label: "Aspect mismatch",
+      title: `Image aspect ${imageAspect} differs from target screen${mismatchedAspect.length > 1 ? "s" : ""}; will crop or letterbox.`
+    };
+  }
+  return { status: "ok", warnings: [] };
+}
+
 function stopSendFlowPolling() {
   if (sendFlowPollTimer) {
     clearInterval(sendFlowPollTimer);
@@ -1598,7 +1667,12 @@ function createOutputImageCard(image) {
   const isSelected = isManageMode
     ? state.ui.contentManageSelections.includes(image.name)
     : state.ui.contentSelectedImage === image.name;
+  const fitCheck = evaluateImageFit(image, getFitCheckTargetScreens());
+  const fitChip = fitCheck.status.startsWith("warn")
+    ? `<span class="content-meta-chip content-meta-chip--warn" title="${fitCheck.title}">${fitCheck.label}</span>`
+    : "";
   const badges = [
+    fitChip,
     ...image.collectionNames.map((name) => `<span class="content-meta-chip">${name}</span>`),
     image.setMembership
       ? `<span class="content-meta-chip content-meta-chip--set">${image.setMembership.setName} ${image.setMembership.position}/${image.setMembership.count}</span>`
@@ -3018,6 +3092,10 @@ function createContentPreviewModal() {
   }
   const dimensionsLine = formatImageDimensions(image);
   const hasEdits = Boolean(image.editRecipe);
+  const fitCheck = evaluateImageFit(image, getFitCheckTargetScreens());
+  const fitWarning = fitCheck.status.startsWith("warn")
+    ? `<p class="content-preview-warning" title="${fitCheck.title}"><strong>${fitCheck.label}.</strong> ${fitCheck.title}</p>`
+    : "";
 
   return `
     <div class="modal-backdrop" data-action="close-content-preview"></div>
@@ -3027,6 +3105,7 @@ function createContentPreviewModal() {
           <p class="modal-kicker">Content Preview${hasEdits ? ` · <span class="content-meta-chip content-meta-chip--edited">Edited</span>` : ""}</p>
           <h2>${image.name}</h2>
           <p class="send-flow-copy">${dimensionsLine ? `${dimensionsLine} · ` : ""}${formatBytes(image.size)} · ${formatDateTime(image.modifiedAt)}</p>
+          ${fitWarning}
         </div>
         <button type="button" class="icon-button icon-button--ghost" data-action="close-content-preview" aria-label="Close preview">
           ${iconSvg("close")}
