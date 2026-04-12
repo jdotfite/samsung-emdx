@@ -158,6 +158,43 @@ test.describe("Content library", () => {
     await expect(page.getByRole("button", { name: "Manage Wall Layouts" })).toBeVisible();
   });
 
+  test("favorite toggle persists and filters", async ({ page }) => {
+    await goToContent(page);
+
+    const portraitCard = page.locator(".output-card", { hasText: "fixture-portrait" });
+    await expect(portraitCard.locator(".content-meta-chip--favorite")).toHaveCount(0);
+
+    await portraitCard.locator('[data-action="toggle-content-favorite"]').click();
+    await expect(portraitCard.locator(".content-meta-chip--favorite")).toBeVisible();
+
+    const favChip = page.locator(".content-library-toolbar-filter-chip");
+    await expect(favChip).toBeVisible();
+    await expect(favChip).toContainText("1");
+    await favChip.click();
+
+    await expect(page.locator(".output-card")).toHaveCount(1);
+    await expect(page.locator(".output-card").first()).toContainText("fixture-portrait");
+
+    await page.locator('[data-action="reset-content-library-filters"]').click();
+    await expect(page.locator(".output-card")).toHaveCount(2);
+
+    await portraitCard.locator('[data-action="toggle-content-favorite"]').click();
+    await expect(portraitCard.locator(".content-meta-chip--favorite")).toHaveCount(0);
+  });
+
+  test("edit modal shows Color and Levels fieldsets", async ({ page }) => {
+    await goToContent(page);
+    await page.locator(".output-card", { hasText: "fixture-portrait" }).locator('[data-action="open-content-edit"]').click();
+    const modal = page.locator(".modal-shell--edit");
+    await expect(modal).toBeVisible();
+    await expect(modal.locator("legend", { hasText: "Color" })).toBeVisible();
+    await expect(modal.locator("legend", { hasText: "Levels" })).toBeVisible();
+    await expect(modal.locator("legend", { hasText: "Detail" })).toBeVisible();
+    await expect(modal.locator('input[name="vibrance"]')).toBeVisible();
+    await modal.getByRole("button", { name: "Cancel" }).click();
+    await expect(modal).toHaveCount(0);
+  });
+
   test("manage mode creates and assigns a collection", async ({ page }) => {
     await goToContent(page);
     await page.locator('[data-action="toggle-content-manage"]').click();
