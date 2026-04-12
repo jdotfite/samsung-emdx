@@ -40,6 +40,8 @@ const state = {
     contentSelectedImage: "",
     contentReplaceImage: "",
     contentLibraryFilter: "all",
+    contentLibrarySearch: "",
+    contentLibrarySort: "recent",
     contentManageMode: false,
     contentManageSelections: [],
     contentEdit: null,
@@ -978,17 +980,51 @@ function getEnrichedOutputImages() {
 function getVisibleOutputImages() {
   const images = getEnrichedOutputImages();
   const filter = state.ui.contentLibraryFilter || "all";
-  if (filter === "all") {
-    return images;
-  }
+  let filtered = images;
   if (filter === "unassigned") {
-    return images.filter((image) => image.collectionNames.length === 0);
-  }
-  if (filter.startsWith("collection:")) {
+    filtered = images.filter((image) => image.collectionNames.length === 0);
+  } else if (filter.startsWith("collection:")) {
     const collectionId = filter.slice("collection:".length);
-    return images.filter((image) => image.contentMeta.collectionIds.includes(collectionId));
+    filtered = images.filter((image) => image.contentMeta.collectionIds.includes(collectionId));
   }
-  return images;
+  const query = (state.ui.contentLibrarySearch || "").trim().toLowerCase();
+  if (query) {
+    filtered = filtered.filter((image) => {
+      if (image.name.toLowerCase().includes(query)) return true;
+      if (image.collectionNames.some((name) => name.toLowerCase().includes(query))) return true;
+      if ((image.contentMeta.tags || []).some((tag) => String(tag).toLowerCase().includes(query))) return true;
+      if (image.orientation && image.orientation.toLowerCase().includes(query)) return true;
+      if (image.format && image.format.toLowerCase().includes(query)) return true;
+      return false;
+    });
+  }
+  return sortOutputImages(filtered, state.ui.contentLibrarySort || "recent");
+}
+
+function sortOutputImages(images, sortKey) {
+  const sorted = [...images];
+  switch (sortKey) {
+    case "name-asc":
+      sorted.sort((a, b) => a.name.localeCompare(b.name));
+      break;
+    case "name-desc":
+      sorted.sort((a, b) => b.name.localeCompare(a.name));
+      break;
+    case "oldest":
+      sorted.sort((a, b) => String(a.modifiedAt || "").localeCompare(String(b.modifiedAt || "")));
+      break;
+    case "largest":
+      sorted.sort((a, b) => ((b.width || 0) * (b.height || 0)) - ((a.width || 0) * (a.height || 0)));
+      break;
+    case "smallest":
+      sorted.sort((a, b) => ((a.width || Infinity) * (a.height || Infinity)) - ((b.width || Infinity) * (b.height || Infinity)));
+      break;
+    case "recent":
+    default:
+      sorted.sort((a, b) => String(b.modifiedAt || "").localeCompare(String(a.modifiedAt || "")));
+      break;
+  }
+  return sorted;
 }
 
 function getContentCollectionSummaries() {
@@ -1794,6 +1830,44 @@ function createContentBrowseCollectionsPanel() {
         ${collectionCards}
       </div>
     </section>
+  `;
+}
+
+function createContentBrowseToolbar() {
+  const query = state.ui.contentLibrarySearch || "";
+  const sortKey = state.ui.contentLibrarySort || "recent";
+  const totalCount = state.outputImages.length;
+  const visibleCount = getVisibleOutputImages().length;
+  const hasFilter = (state.ui.contentLibraryFilter || "all") !== "all" || Boolean(query);
+  return `
+    <div class="content-library-toolbar">
+      <div class="content-library-toolbar-search">
+        <input
+          id="content-library-search"
+          type="search"
+          placeholder="Search by name, tag, collection, orientation"
+          value="${query.replace(/"/g, "&quot;")}"
+          autocomplete="off"
+          spellcheck="false"
+        />
+        ${query ? `<button type="button" class="content-library-toolbar-clear" data-action="clear-content-library-search" aria-label="Clear search">×</button>` : ""}
+      </div>
+      <div class="content-library-toolbar-controls">
+        <label class="content-library-toolbar-sort">
+          <span>Sort</span>
+          <select id="content-library-sort">
+            <option value="recent" ${sortKey === "recent" ? "selected" : ""}>Newest first</option>
+            <option value="oldest" ${sortKey === "oldest" ? "selected" : ""}>Oldest first</option>
+            <option value="name-asc" ${sortKey === "name-asc" ? "selected" : ""}>Name A→Z</option>
+            <option value="name-desc" ${sortKey === "name-desc" ? "selected" : ""}>Name Z→A</option>
+            <option value="largest" ${sortKey === "largest" ? "selected" : ""}>Largest resolution</option>
+            <option value="smallest" ${sortKey === "smallest" ? "selected" : ""}>Smallest resolution</option>
+          </select>
+        </label>
+        <span class="content-library-toolbar-count">${visibleCount} of ${totalCount}</span>
+        ${hasFilter ? `<button type="button" class="content-library-toolbar-reset" data-action="reset-content-library-filters">Reset</button>` : ""}
+      </div>
+    </div>
   `;
 }
 
@@ -3324,6 +3398,7 @@ function createSectionPanel() {
               </div>
               ${createContentBrowseCollectionsPanel()}
               ${createContentCollectionScopePanel()}
+              ${createContentBrowseToolbar()}
             `
             : ""
         }
@@ -3553,6 +3628,22 @@ function bindWorkspaceEvents() {
 
   document.getElementById("studio-template-select")?.addEventListener("change", (event) => {
     state.studio.albumArt.templateId = event.target.value;
+    renderWorkspace();
+  });
+
+  document.getElementById("content-library-search")?.addEventListener("input", (event) => {
+    state.ui.contentLibrarySearch = event.target.value;
+    renderWorkspace();
+    const restored = document.getElementById("content-library-search");
+    if (restored) {
+      restored.focus();
+      const len = restored.value.length;
+      try { restored.setSelectionRange(len, len); } catch {}
+    }
+  });
+
+  document.getElementById("content-library-sort")?.addEventListener("change", (event) => {
+    state.ui.contentLibrarySort = event.target.value;
     renderWorkspace();
   });
 
@@ -3997,6 +4088,20 @@ async function handleAction(button) {
         state.ui.contentSelectedImage = getVisibleOutputImages()[0]?.name || "";
       }
     }
+    renderWorkspace();
+    return;
+  }
+
+  if (action === "clear-content-library-search") {
+    state.ui.contentLibrarySearch = "";
+    renderWorkspace();
+    return;
+  }
+
+  if (action === "reset-content-library-filters") {
+    state.ui.contentLibraryFilter = "all";
+    state.ui.contentLibrarySearch = "";
+    state.ui.contentLibrarySort = "recent";
     renderWorkspace();
     return;
   }

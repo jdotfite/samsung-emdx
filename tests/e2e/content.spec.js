@@ -53,6 +53,33 @@ test.describe("Content library", () => {
     await expect(page.locator(".output-card", { hasText: "fixture-portrait" }).locator(".content-meta-chip--edited")).toHaveCount(0);
   });
 
+  test("search filters cards by filename", async ({ page }) => {
+    await goToContent(page);
+    const cards = page.locator(".output-card");
+    await expect(cards).toHaveCount(2);
+
+    const searchInput = page.locator("#content-library-search");
+    await searchInput.fill("portrait");
+    await expect(cards).toHaveCount(1);
+    await expect(cards.first()).toContainText("fixture-portrait");
+
+    await page.locator('[data-action="clear-content-library-search"]').click();
+    await expect(page.locator(".output-card")).toHaveCount(2);
+  });
+
+  test("sort control reorders the grid", async ({ page }) => {
+    await goToContent(page);
+    await page.locator("#content-library-sort").selectOption("name-asc");
+    const names = await page.locator(".output-card strong").allInnerTexts();
+    expect(names[0]).toContain("fixture-landscape");
+    expect(names[1]).toContain("fixture-portrait");
+
+    await page.locator("#content-library-sort").selectOption("name-desc");
+    const namesDesc = await page.locator(".output-card strong").allInnerTexts();
+    expect(namesDesc[0]).toContain("fixture-portrait");
+    expect(namesDesc[1]).toContain("fixture-landscape");
+  });
+
   test("manage mode creates and assigns a collection", async ({ page }) => {
     await goToContent(page);
     await page.locator('[data-action="toggle-content-manage"]').click();
