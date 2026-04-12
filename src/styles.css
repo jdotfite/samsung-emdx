@@ -1940,6 +1940,36 @@ textarea {
   text-overflow: ellipsis;
 }
 
+.content-meta-chip--favorite {
+  color: #b8860b;
+}
+
+.output-card-actions .is-favorite {
+  color: #b8860b;
+}
+
+.content-library-toolbar-filter-chip {
+  padding: 8px 14px;
+  border-radius: 14px;
+  border: 1px solid rgba(20, 18, 13, 0.12);
+  background: rgba(255, 255, 255, 0.6);
+  color: var(--ink);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.content-library-toolbar-filter-chip.is-selected {
+  background: var(--surface-strong);
+  color: var(--control-text-on-dark);
+  border-color: transparent;
+}
+
+.content-set-thumb-facts {
+  font-size: 10px;
+  color: var(--muted);
+  opacity: 0.7;
+}
+
 .content-set-card-footer {
   display: flex;
   justify-content: space-between;

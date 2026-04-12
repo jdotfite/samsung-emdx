@@ -958,7 +958,9 @@ function normalizeContentLibrary(contentLibrary = {}) {
             ? [...new Set(meta.collectionIds.filter((id) => collectionIds.has(id)))]
             : [];
           const editRecipe = normalizeEditRecipe(meta?.editRecipe || null);
-          return [imageName, { tags, collectionIds: nextCollectionIds, editRecipe }];
+          const favorite = Boolean(meta?.favorite);
+          const lastSentAt = typeof meta?.lastSentAt === "string" ? meta.lastSentAt : "";
+          return [imageName, { tags, collectionIds: nextCollectionIds, editRecipe, favorite, lastSentAt }];
         }),
       )
     : {};
@@ -1260,7 +1262,9 @@ function getContentImageMeta(imageName) {
   return {
     tags: Array.isArray(meta.tags) ? meta.tags : [],
     collectionIds: Array.isArray(meta.collectionIds) ? meta.collectionIds : [],
-    editRecipe: meta.editRecipe || null
+    editRecipe: meta.editRecipe || null,
+    favorite: Boolean(meta.favorite),
+    lastSentAt: meta.lastSentAt || ""
   };
 }
 
@@ -1296,7 +1300,9 @@ function getEnrichedOutputImages() {
       collections,
       collectionNames: collections.map((collection) => collection.name),
       setMembership: memberships.get(image.name) || null,
-      editRecipe: meta.editRecipe || null
+      editRecipe: meta.editRecipe || null,
+      favorite: meta.favorite,
+      lastSentAt: meta.lastSentAt || ""
     };
   });
 }
@@ -1305,7 +1311,9 @@ function getVisibleOutputImages() {
   const images = getEnrichedOutputImages();
   const filter = state.ui.contentLibraryFilter || "all";
   let filtered = images;
-  if (filter === "unassigned") {
+  if (filter === "favorites") {
+    filtered = images.filter((image) => image.favorite);
+  } else if (filter === "unassigned") {
     filtered = images.filter((image) => image.collectionNames.length === 0);
   } else if (filter.startsWith("collection:")) {
     const collectionId = filter.slice("collection:".length);
@@ -1342,6 +1350,24 @@ function sortOutputImages(images, sortKey) {
       break;
     case "smallest":
       sorted.sort((a, b) => ((a.width || Infinity) * (a.height || Infinity)) - ((b.width || Infinity) * (b.height || Infinity)));
+      break;
+    case "recently-edited":
+      sorted.sort((a, b) => {
+        const aTime = a.editRecipe?.updatedAt || "";
+        const bTime = b.editRecipe?.updatedAt || "";
+        if (bTime && !aTime) return 1;
+        if (aTime && !bTime) return -1;
+        return String(bTime).localeCompare(String(aTime));
+      });
+      break;
+    case "recently-sent":
+      sorted.sort((a, b) => {
+        const aTime = a.lastSentAt || "";
+        const bTime = b.lastSentAt || "";
+        if (bTime && !aTime) return 1;
+        if (aTime && !bTime) return -1;
+        return String(bTime).localeCompare(String(aTime));
+      });
       break;
     case "recent":
     default:
@@ -1541,6 +1567,16 @@ function getContentSetMappings(set, { enabledOnly = false } = {}) {
     issues,
     canSend: Boolean(wallContext) && mappings.length > 0 && issues.length === 0
   };
+}
+
+function toggleContentFavorite(imageName) {
+  const current = getContentImageMeta(imageName);
+  state.project.contentLibrary.items[imageName] = {
+    ...current,
+    favorite: !current.favorite
+  };
+  state.project.contentLibrary = normalizeContentLibrary(state.project.contentLibrary);
+  return !current.favorite;
 }
 
 function clearImagesFromCollections(imageNames) {
@@ -2211,7 +2247,8 @@ function createOutputImageCard(image) {
     image.setMembership
       ? `<span class="content-meta-chip content-meta-chip--set">${image.setMembership.setName} ${image.setMembership.position}/${image.setMembership.count}</span>`
       : "",
-    image.editRecipe ? `<span class="content-meta-chip content-meta-chip--edited">Edited</span>` : ""
+    image.editRecipe ? `<span class="content-meta-chip content-meta-chip--edited">Edited</span>` : "",
+    image.favorite ? `<span class="content-meta-chip content-meta-chip--favorite">★</span>` : ""
   ].filter(Boolean);
   const dimensionsLine = formatImageDimensions(image);
   const metaLine = dimensionsLine
@@ -2230,6 +2267,16 @@ function createOutputImageCard(image) {
         !isManageMode
           ? `
             <div class="output-card-actions">
+              <button
+                type="button"
+                class="icon-button icon-button--ghost icon-button--small ${image.favorite ? "is-favorite" : ""}"
+                data-action="toggle-content-favorite"
+                data-image-name="${image.name}"
+                aria-label="${image.favorite ? "Unfavorite" : "Favorite"} ${image.name}"
+                title="${image.favorite ? "Unfavorite" : "Favorite"}"
+              >
+                ${image.favorite ? "★" : "☆"}
+              </button>
               <button
                 type="button"
                 class="icon-button icon-button--ghost icon-button--small"
@@ -2390,6 +2437,7 @@ function createContentSetCard(set) {
         <div class="content-set-thumb-meta">
           <strong>${mapping.item.imageName}</strong>
           <span>${slotLabel} → ${mapLabel}</span>
+          ${image ? `<span class="content-set-thumb-facts">${getContentAssetFactLabels(image, { includeSize: false }).join(" · ")}</span>` : ""}
         </div>
       </div>
     `;
@@ -2511,6 +2559,7 @@ function createContentSetEditorModal() {
                   <span class="device-summary-kicker">Panel ${index + 1}</span>
                   <strong>${mapping.item.imageName}</strong>
                   <span>${mapping.targetScreen ? `Mapped to ${mapping.targetScreen.name}` : "No matching frame yet"}</span>
+                  ${image ? `<span class="content-set-thumb-facts">${getContentAssetFactLabels(image, { includeSize: false }).join(" · ")}</span>` : ""}
                 </div>
                 <label class="content-set-editor-field">
                   <span>Slot</span>
@@ -2561,6 +2610,12 @@ function createContentScheduleCard(schedule) {
   const nextLabel = getContentScheduleNextLabel(schedule);
   const statusLabel = getContentScheduleStatusLabel(schedule);
   const kindLabel = schedule.kind === "set" ? "Wall layout" : "Poster";
+  const scheduleImage = schedule.kind === "image"
+    ? getEnrichedOutputImages().find((entry) => entry.name === schedule.imageName)
+    : null;
+  const assetFacts = scheduleImage
+    ? getContentAssetFactLabels(scheduleImage, { includeSize: false }).join(" · ")
+    : "";
   return `
     <article class="content-schedule-card" data-schedule-id="${schedule.id}">
       <header class="content-schedule-card-header">
@@ -2569,6 +2624,7 @@ function createContentScheduleCard(schedule) {
           <strong>${schedule.name}</strong>
           <span>${target.title}</span>
           <span>${target.detail}</span>
+          ${assetFacts ? `<span class="content-set-thumb-facts">${assetFacts}</span>` : ""}
         </div>
         <div class="content-set-card-tools">
           <button
@@ -2742,9 +2798,11 @@ function createContentScheduleModal() {
 function createContentBrowseToolbar() {
   const query = state.ui.contentLibrarySearch || "";
   const sortKey = state.ui.contentLibrarySort || "recent";
+  const filter = state.ui.contentLibraryFilter || "all";
   const totalCount = state.outputImages.length;
   const visibleCount = getVisibleOutputImages().length;
-  const hasFilter = (state.ui.contentLibraryFilter || "all") !== "all" || Boolean(query);
+  const favoriteCount = getEnrichedOutputImages().filter((image) => image.favorite).length;
+  const hasFilter = filter !== "all" || Boolean(query);
   return `
     <div class="content-library-toolbar">
       <div class="content-library-toolbar-search">
@@ -2768,8 +2826,11 @@ function createContentBrowseToolbar() {
             <option value="name-desc" ${sortKey === "name-desc" ? "selected" : ""}>Name Z→A</option>
             <option value="largest" ${sortKey === "largest" ? "selected" : ""}>Largest resolution</option>
             <option value="smallest" ${sortKey === "smallest" ? "selected" : ""}>Smallest resolution</option>
+            <option value="recently-edited" ${sortKey === "recently-edited" ? "selected" : ""}>Recently edited</option>
+            <option value="recently-sent" ${sortKey === "recently-sent" ? "selected" : ""}>Recently sent</option>
           </select>
         </label>
+        ${favoriteCount ? `<button type="button" class="content-library-toolbar-filter-chip ${filter === "favorites" ? "is-selected" : ""}" data-action="filter-content-library" data-filter="${filter === "favorites" ? "all" : "favorites"}">★ ${favoriteCount}</button>` : ""}
         <span class="content-library-toolbar-count">${visibleCount} of ${totalCount}</span>
         ${hasFilter ? `<button type="button" class="content-library-toolbar-reset" data-action="reset-content-library-filters">Reset</button>` : ""}
       </div>
@@ -4114,6 +4175,7 @@ function createContentPreviewModal() {
         </div>
       </div>
       <div class="modal-footer modal-footer--preview">
+        <button type="button" class="secondary" data-action="toggle-content-favorite" data-image-name="${image.name}">${image.favorite ? "★ Unfavorite" : "☆ Favorite"}</button>
         ${hasEdits ? `<button type="button" class="secondary" data-action="reset-content-edit" data-image-name="${image.name}">Reset edits</button>` : ""}
         <button type="button" data-action="open-content-edit" data-image-name="${image.name}">Edit image</button>
         <button type="button" class="secondary" data-action="open-content-image-schedule" data-image-name="${image.name}" ${targetScreens.length ? "" : "disabled"}>Schedule</button>
@@ -4264,11 +4326,19 @@ function createContentEditModal() {
           </fieldset>
 
           <fieldset class="content-edit-group">
-            <legend>Tone</legend>
+            <legend>Color</legend>
             <label class="content-edit-toggle">
               <input type="checkbox" name="grayscale" ${draft.grayscale ? "checked" : ""} />
               <span>Grayscale</span>
             </label>
+            <label class="content-edit-slider">
+              <span>Vibrance <em data-value-for="vibrance">${draft.vibrance.toFixed(2)}</em></span>
+              <input type="range" name="vibrance" min="0.5" max="1.8" step="0.05" value="${draft.vibrance}" />
+            </label>
+          </fieldset>
+
+          <fieldset class="content-edit-group">
+            <legend>Levels</legend>
             <label class="content-edit-slider">
               <span>Brightness <em data-value-for="brightness">${draft.brightness.toFixed(2)}</em></span>
               <input type="range" name="brightness" min="0.5" max="1.5" step="0.05" value="${draft.brightness}" />
@@ -4280,10 +4350,6 @@ function createContentEditModal() {
             <label class="content-edit-slider">
               <span>Gamma <em data-value-for="gamma">${draft.gamma.toFixed(2)}</em></span>
               <input type="range" name="gamma" min="1" max="3" step="0.1" value="${draft.gamma}" />
-            </label>
-            <label class="content-edit-slider">
-              <span>Vibrance <em data-value-for="vibrance">${draft.vibrance.toFixed(2)}</em></span>
-              <input type="range" name="vibrance" min="0.5" max="1.8" step="0.05" value="${draft.vibrance}" />
             </label>
             <label class="content-edit-slider">
               <span>Black point <em data-value-for="blackPoint">${draft.blackPoint.toFixed(2)}</em></span>
@@ -5059,6 +5125,18 @@ async function handleAction(button) {
         state.ui.contentSelectedImage = getVisibleOutputImages()[0]?.name || "";
       }
     }
+    renderWorkspace();
+    return;
+  }
+
+  if (action === "toggle-content-favorite") {
+    const imageName = button.dataset.imageName || "";
+    if (!imageName) {
+      renderWorkspace();
+      return;
+    }
+    const nowFavorite = toggleContentFavorite(imageName);
+    persistProject();
     renderWorkspace();
     return;
   }
@@ -5863,8 +5941,17 @@ async function handleAction(button) {
     stopSendFlowPolling();
     state.deviceState = await loadDeviceState();
     if (state.ui.sendFlow?.status === "completed") {
-      state.actions.notice = `Sent ${state.ui.sendFlow.imageName} to ${state.ui.sendFlow.targetNames.join(", ")}.`;
+      const sentName = state.ui.sendFlow.imageName || "";
+      state.actions.notice = `Sent ${sentName} to ${state.ui.sendFlow.targetNames.join(", ")}.`;
       state.actions.error = "";
+      if (sentName && !sentName.startsWith("Set: ")) {
+        const current = getContentImageMeta(sentName);
+        state.project.contentLibrary.items[sentName] = {
+          ...current,
+          lastSentAt: new Date().toISOString()
+        };
+        persistProject();
+      }
     }
     state.ui.sendFlow = null;
     renderWorkspace();
