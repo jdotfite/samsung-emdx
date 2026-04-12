@@ -1,73 +1,164 @@
-**Findings**
-1. The new send-progress modal is still simulated on the client, not driven by real backend milestones. That means the UI can show “Waking displays” or “Refreshing display” even if the backend is already ahead, stalled, or failed for a different reason. This is the biggest trust gap in the current app. See [app.js](/C:/_websites/poster-creator/src/app.js#L8), [app.js](/C:/_websites/poster-creator/src/app.js#L430), [app.js](/C:/_websites/poster-creator/src/app.js#L755), [app.js](/C:/_websites/poster-creator/src/app.js#L1365).
+**Current Product Review**
 
-2. The delivery path now always does `wake -> wait -> send -> wait -> resend` whenever a MAC is present. It works, but it doubles every send and hides whether the first send was actually needed or successful. That will become expensive and hard to reason about once you have more displays or schedules. See [send-service.mjs](/C:/_websites/poster-creator/scripts/lib/send-service.mjs#L26).
+The app now has four real product surfaces:
+- `Devices`: grouped by room and wall, with room/wall management
+- `Content`: browse, collections, ordered sets, preview, edit, send, and scheduling
+- `Studio`: Spotify-driven source import and poster generation
+- `Delivery`: wake/status/send job flow
 
-3. “Enabled” is enforced in the UI but not in the backend send route. The Content screen hides disabled devices, but `/api/content/send` will still send to any stored screen id if posted directly. That inconsistency will matter once you add automations, groups, or sharing. See [app.js](/C:/_websites/poster-creator/src/app.js#L954) and [app.mjs](/C:/_websites/poster-creator/server/app.mjs#L214).
+The current bottleneck is no longer missing features at the top level. It is trust and consistency inside the Content workflow, especially edit mode.
 
-4. There is still no persisted content-assignment model. The app stores only “last image sent” preview state, not “this device is assigned to this content item/source/profile.” That blocks reliable scheduling, rebroadcast, and future music/movie/profile separation. See [device-state-store.mjs](/C:/_websites/poster-creator/server/device-state-store.mjs#L27).
+**What Is Working**
 
-5. The codebase and docs are still split between the old poster-wall architecture and the newer device/content/studio product. The README is outdated, and `src/app.js` is carrying device UI, content UI, studio import, poster rendering, send flow, and legacy hooks in one file. That is the main maintainability risk now. See [README.md](/C:/_websites/poster-creator/README.md#L101), [app.js](/C:/_websites/poster-creator/src/app.js#L1), [app.js](/C:/_websites/poster-creator/src/app.js#L1112).
+1. Devices are now meaningfully organized by room and wall instead of a flat list.
+2. Content has a real organization model: collections, sets, search, sort, preview, and send.
+3. Studio supports album discovery/import and can generate posters into the shared Content library.
+4. Toast messaging is in place, so errors and notices no longer need to consume vertical page space.
+5. The send flow is a real product surface, not just a hidden background action.
 
-**Current State**
-The project is past prototype stage. Device wake/status/send works, uploaded images can be sent from the UI, and the app now has the right top-level product split: `Devices`, `Content`, `Studio`.
+**What Changed In This Pass**
 
-Where it is weak is model clarity:
-- devices exist, but assignments do not
-- content exists, but as files rather than first-class records
-- studio exists, but it is still partly mixed with the old poster engine
-- send UX exists, but its progress is inferred rather than real
+1. Edit mode now targets one canonical Samsung frame spec instead of asking the user to choose a target frame.
+2. Edit preview is now rendered through the backend image pipeline instead of mixing CSS-only preview behavior with save-time transforms.
+3. Manual crop controls now exist directly in the edit modal:
+   - zoom
+   - horizontal position
+   - vertical position
+4. Vibrance is now part of the image recipe.
+5. Closing the edit modal no longer relies on the browser-native unsaved-changes confirm for that flow.
+6. Content search/sort and edit selects have had a consistency pass so they align more closely with the existing Spotify/workspace field language.
+7. Content preview surfaces now render the saved edited result instead of always showing the original source image.
+8. Ordered wall layouts now sit behind `Manage Library`, so normal browse mode stays focused on:
+   - pick
+   - preview
+   - send
+9. Creating a new ordered set now opens its layout editor immediately, which makes wall assignment the natural next step instead of a hidden follow-up action.
+10. Content scheduling now exists for both:
+   - single posters sent to selected frames
+   - ordered wall layouts sent to their mapped wall
+11. Automation now sits with manage mode so browse mode stays focused on immediate selection and send.
 
-**Plan**
-1. Build a real send job model.
-Use SQLite-backed `send_jobs` and `send_job_targets`, return a `jobId` from `POST /api/content/send`, and have the modal poll `/api/send-jobs/:id`. Stages should be real: `queued`, `waking`, `sending`, `verifying`, `completed`, `failed`. This should be the next change.
+**What Is Still Not Yet Finished**
 
-2. Add first-class content records.
-Create a `contents` table for uploaded/generated assets with fields like `id`, `title`, `type`, `path`, `thumbnail`, `source`, `created_at`. Then add `device_assignments` so a device can be assigned content independently of the most recent send.
+1. Edit mode is much closer to trustworthy now, but it still needs final UX shaping.
+   The open question is not whether the transforms work.
+   The open question is whether the control model is the cleanest one for users:
+   - quick fit
+   - manual crop
+   - tone/detail
 
-3. Separate ephemeral send from assignment.
-On Content, make the actions explicit:
-- `Send Now`
-- `Assign to Device`
-Later:
-- `Assign and Send`
-That clears up what “current content” means on the Devices page.
+2. Ordered sets exist in the model and UI, but they still need stronger wall-aware workflow language.
+   The foundation is now in place:
+   - create ordered set
+   - assign it to a wall
+   - map each poster to left/center/right
+   - send set to wall
+   - schedule set to wall
+   The next step is making that workflow even more obvious in the overall Content journey.
 
-4. Tighten the device model.
-Replace the vague `enabled` flag with something like:
-- `visible`
-- `sendEnabled`
-- later `group`
-Also enforce send eligibility in the backend, not just the UI.
+3. Content metadata is present, but not yet complete as a true media asset model.
+   Resolution and orientation should be first-class.
+   Edit state should be first-class.
+   Display-prep state should be first-class.
 
-5. Split the frontend by section.
-Break [app.js](/C:/_websites/poster-creator/src/app.js#L1) into:
-- `devices-view.js`
-- `content-view.js`
-- `studio-view.js`
-- `send-flow.js`
-- `device-modal.js`
-This is the point where future work gets easier instead of harder.
+**New Direction Confirmed**
 
-6. Move poster generation fully into Studio.
-Keep Devices and Content operationally simple. Studio should own:
-- Spotify import
-- playlist-to-album workflows
-- poster template selection
-- future movie poster generation
+The product only needs to support one canonical Samsung frame type.
+That means edit mode should stop asking the user to choose a target screen when all enabled screens share the same intended output spec.
+Editing should default to the canonical frame dimensions and preview exactly that result.
 
-7. Update the docs to match reality.
-The README should describe the current product as a Samsung EMDX controller with content library, device inventory, and studio/generation workflows, not the original poster-wall tool.
+**Action Items**
 
-**Recommended Order**
-1. Real send jobs + modal polling
-2. Content records + device assignments
-3. Backend enforcement of device send state
-4. Frontend file split
-5. Studio refactor for Spotify/posters
-6. README refresh
+**P0: Trust And Consistency**
 
-**Open Questions**
-- Should `Send` also update the device’s assigned content, or stay purely temporary?
-- Should Devices show disabled/offline frames by default, or only active ones?
-- Do you want the next milestone to focus on reliability first, or on building the Studio workflows for playlists/artists?
+1. Done: make edit mode target one canonical frame spec by default.
+2. Done: replace the mixed CSS/server edit preview with a real rendered preview path.
+3. In progress: surface image resolution, orientation, and format everywhere Content decisions are made.
+4. Done for edit mode: replace browser-native unsaved-edit confirmation with a polished in-app confirmation.
+5. In progress: restyle Content search and sort controls so they match the Spotify/workspace form language.
+6. In progress: audit all dropdowns/selects in Content/Edit so they use the same visual system.
+7. Next: verify that all preview surfaces use the same display-prep truth, not a mix of raw source and framed output.
+
+**P1: Edit Mode Completion**
+
+1. Done: add vibrance control.
+2. Done: add free zoom for manual crop.
+3. Done: add horizontal and vertical image positioning inside the canonical frame.
+4. Done: clarify quick-fit presets versus manual crop mode in the edit UI.
+5. Keep edit recipes non-destructive and saveable as either:
+   - applied recipe on original asset
+   - saved copy
+6. Consider whether `invert` should stay hidden, move to an advanced section, or be removed entirely from the recipe.
+
+**P1: Content Workflow Clarity**
+
+1. Keep browse mode optimized for:
+   - pick
+   - preview
+   - send
+   Wall layouts should appear here only as a lightweight entry point back into management, not as the primary browse surface.
+2. Keep manage mode optimized for:
+   - multi-select
+   - collection assignment
+   - set creation
+3. Keep edit mode optimized for:
+   - image preparation for e-ink display
+4. Keep automation optimized for:
+   - timed single sends
+   - timed wall layout sends
+   - clear pause/resume/delete management
+
+**P2: Sets And Wall Delivery**
+
+1. In progress: improve set workflow language around triptychs and ordered wall layouts.
+2. Done: add explicit left/center/right mapping in the set editor.
+3. Done: add `Send Set to Wall` as a first-class action.
+4. Done: add first-pass scheduling for single posters and ordered wall layouts.
+5. Later connect that same model to Home Assistant / external automation.
+
+**P2: Library Quality**
+
+1. Add favorites or pinned content.
+2. Add recently sent / recently edited views.
+3. Add richer asset info in preview:
+   - dimensions
+   - file size
+   - orientation
+   - format
+   - fit warning
+
+**P3: Reliability And Maintainability**
+
+1. Add Playwright coverage for:
+   - Content browse/manage/edit flows
+   - collection assignment
+   - set creation
+   - edit save/reset/cancel
+2. Split the frontend by surface once the current Content flow is stabilized.
+3. Refresh the README so it describes the current product accurately.
+
+**Recommended Next Slice**
+
+1. Finish the control model for edit mode:
+   - tone/detail
+2. Complete the metadata pass so every content decision surface clearly shows:
+   - dimensions
+   - file size
+   - orientation
+   - format
+3. Improve ordered set language around triptychs and wall delivery.
+4. Build wall-level automation hooks on top of the new set model.
+5. Add automated coverage for the content flows before doing another large UX pass.
+
+**Notes Against Similar Apps**
+
+The closest interaction pattern is:
+- Google Photos for browse vs albums vs editing separation
+- Canva for explicit image preparation and adjustment tooling
+
+This app should follow the same structural split:
+- Browse
+- Organize
+- Edit for display
+
+That is the clearest model for the product now.

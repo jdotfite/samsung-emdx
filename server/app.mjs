@@ -1,9 +1,11 @@
 import express from "express";
 import path from "node:path";
 import fs from "node:fs";
+import crypto from "node:crypto";
 import sharp from "sharp";
 import { env } from "./env.mjs";
 import { deleteImportedAlbums, listAllCatalogEntries, loadAlbumBySlug } from "./album-store.mjs";
+import { loadContentSchedulesFromStore, saveContentSchedulesToStore } from "./content-schedule-store.mjs";
 import { loadDeviceStateFromStore, recordSentImages } from "./device-state-store.mjs";
 import { loadProjectFromStore, saveProjectToStore } from "./project-store.mjs";
 import { applyEditRecipe, normalizeEditRecipe, writeEditCache } from "../scripts/lib/image-edit-service.mjs";
@@ -32,6 +34,333 @@ const rootDir = process.cwd();
 const outputDir = env.outputDir;
 const editCacheDir = path.join(outputDir, ".edit-cache");
 const outputImagePattern = /\.(png|jpe?g|webp)$/i;
+const CONTENT_SCHEDULE_KINDS = new Set(["image", "set"]);
+const CONTENT_SCHEDULE_RECURRENCES = new Set(["once", "daily", "weekly"]);
+const LOCAL_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+const LOCAL_TIME_PATTERN = /^(?:[01]\d|2[0-3]):[0-5]\d$/;
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function getDefaultTimeZone() {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || "America/New_York";
+  } catch {
+    return "America/New_York";
+  }
+}
+
+function createLocalDateKey(date = new Date()) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function parseLocalTimeMinutes(value) {
+  if (!LOCAL_TIME_PATTERN.test(String(value || ""))) {
+    return null;
+  }
+  const [hours, minutes] = String(value).split(":").map((part) => Number.parseInt(part, 10));
+  return (hours * 60) + minutes;
+}
+
+function getCurrentLocalMinutes(date = new Date()) {
+  return (date.getHours() * 60) + date.getMinutes();
+}
+
+function sortSchedules(a, b) {
+  const enabledDiff = Number(Boolean(b.enabled)) - Number(Boolean(a.enabled));
+  if (enabledDiff !== 0) {
+    return enabledDiff;
+  }
+
+  const updatedDiff = String(b.updatedAt || "").localeCompare(String(a.updatedAt || ""));
+  if (updatedDiff !== 0) {
+    return updatedDiff;
+  }
+
+  return String(a.name || "").localeCompare(String(b.name || ""));
+}
+
+function normalizeStoredContentSchedule(raw = {}) {
+  const kind = CONTENT_SCHEDULE_KINDS.has(String(raw.kind || "").trim()) ? String(raw.kind).trim() : "image";
+  const recurrence = CONTENT_SCHEDULE_RECURRENCES.has(String(raw.recurrence || "").trim())
+    ? String(raw.recurrence).trim()
+    : "once";
+  const enabled = raw.enabled !== false;
+  const schedule = {
+    id: String(raw.id || "").trim(),
+    name: String(raw.name || "").trim(),
+    kind,
+    recurrence,
+    enabled,
+    imageName: kind === "image" ? String(raw.imageName || "").trim() : "",
+    screenIds: kind === "image" && Array.isArray(raw.screenIds)
+      ? [...new Set(raw.screenIds.map((id) => String(id || "").trim()).filter(Boolean))]
+      : [],
+    setId: kind === "set" ? String(raw.setId || "").trim() : "",
+    runAt: recurrence === "once" ? String(raw.runAt || "").trim() : "",
+    startDate: recurrence === "once" ? "" : String(raw.startDate || "").trim(),
+    localTime: recurrence === "once" ? "" : String(raw.localTime || "").trim(),
+    weekday: recurrence === "weekly" && Number.isInteger(raw.weekday) ? Number(raw.weekday) : null,
+    timeZone: String(raw.timeZone || "").trim() || getDefaultTimeZone(),
+    createdAt: String(raw.createdAt || "").trim() || nowIso(),
+    updatedAt: String(raw.updatedAt || "").trim() || nowIso(),
+    lastRunAt: String(raw.lastRunAt || "").trim(),
+    lastRunKey: String(raw.lastRunKey || "").trim(),
+    lastJobId: String(raw.lastJobId || "").trim(),
+    lastStatus: String(raw.lastStatus || "").trim(),
+    lastError: String(raw.lastError || "").trim()
+  };
+
+  if (!LOCAL_DATE_PATTERN.test(schedule.startDate)) {
+    schedule.startDate = "";
+  }
+  if (!LOCAL_TIME_PATTERN.test(schedule.localTime)) {
+    schedule.localTime = "";
+  }
+  if (schedule.recurrence !== "weekly") {
+    schedule.weekday = null;
+  }
+
+  return schedule;
+}
+
+function listContentSchedules() {
+  return loadContentSchedulesFromStore()
+    .map((schedule) => normalizeStoredContentSchedule(schedule))
+    .filter((schedule) => schedule.id)
+    .sort(sortSchedules);
+}
+
+function saveContentSchedules(schedules) {
+  return saveContentSchedulesToStore(
+    schedules
+      .map((schedule) => normalizeStoredContentSchedule(schedule))
+      .filter((schedule) => schedule.id)
+      .sort(sortSchedules),
+  );
+}
+
+function getContentScheduleById(scheduleId) {
+  return listContentSchedules().find((schedule) => schedule.id === scheduleId) || null;
+}
+
+function upsertContentSchedule(scheduleId, nextValue) {
+  const schedules = listContentSchedules();
+  const index = schedules.findIndex((schedule) => schedule.id === scheduleId);
+  if (index === -1) {
+    return null;
+  }
+
+  schedules[index] = normalizeStoredContentSchedule(nextValue);
+  saveContentSchedules(schedules);
+  return getContentScheduleById(scheduleId);
+}
+
+function updateContentScheduleRecord(scheduleId, updater) {
+  const current = getContentScheduleById(scheduleId);
+  if (!current) {
+    return null;
+  }
+
+  const nextValue = typeof updater === "function"
+    ? updater(structuredClone(current))
+    : { ...current, ...(updater || {}) };
+  return upsertContentSchedule(scheduleId, nextValue);
+}
+
+function deleteContentScheduleRecord(scheduleId) {
+  const schedules = listContentSchedules();
+  const nextSchedules = schedules.filter((schedule) => schedule.id !== scheduleId);
+  if (nextSchedules.length === schedules.length) {
+    return null;
+  }
+
+  saveContentSchedules(nextSchedules);
+  return schedules.find((schedule) => schedule.id === scheduleId) || null;
+}
+
+function validateContentScheduleInput(input, { currentId = "" } = {}) {
+  const project = loadProjectFromStore();
+  const kind = CONTENT_SCHEDULE_KINDS.has(String(input?.kind || "").trim()) ? String(input.kind).trim() : "";
+  if (!kind) {
+    throw Object.assign(new Error("Choose whether this schedule sends a poster or a wall layout."), { statusCode: 400 });
+  }
+
+  const recurrence = CONTENT_SCHEDULE_RECURRENCES.has(String(input?.recurrence || "").trim())
+    ? String(input.recurrence).trim()
+    : "";
+  if (!recurrence) {
+    throw Object.assign(new Error("Choose a schedule frequency."), { statusCode: 400 });
+  }
+
+  const name = String(input?.name || "").trim();
+  const enabled = input?.enabled !== false;
+  const timeZone = String(input?.timeZone || "").trim() || getDefaultTimeZone();
+  const createdAt = String(input?.createdAt || "").trim() || nowIso();
+  const updatedAt = nowIso();
+
+  const baseSchedule = {
+    id: currentId || String(input?.id || "").trim(),
+    name,
+    kind,
+    recurrence,
+    enabled,
+    imageName: "",
+    screenIds: [],
+    setId: "",
+    runAt: "",
+    startDate: "",
+    localTime: "",
+    weekday: null,
+    timeZone,
+    createdAt,
+    updatedAt,
+    lastRunAt: String(input?.lastRunAt || "").trim(),
+    lastRunKey: String(input?.lastRunKey || "").trim(),
+    lastJobId: String(input?.lastJobId || "").trim(),
+    lastStatus: String(input?.lastStatus || "").trim(),
+    lastError: String(input?.lastError || "").trim()
+  };
+
+  if (kind === "image") {
+    const imageName = String(input?.imageName || "").trim();
+    const screenIds = Array.isArray(input?.screenIds)
+      ? [...new Set(input.screenIds.map((id) => String(id || "").trim()).filter(Boolean))]
+      : [];
+
+    if (!imageName) {
+      throw Object.assign(new Error("Choose a poster to schedule."), { statusCode: 400 });
+    }
+    if (path.basename(imageName) !== imageName) {
+      throw Object.assign(new Error("Invalid poster name."), { statusCode: 400 });
+    }
+    if (!screenIds.length) {
+      throw Object.assign(new Error("Choose at least one target frame for this poster schedule."), { statusCode: 400 });
+    }
+    const validScreenIds = new Set((project?.screens || []).map((screen) => screen.id));
+    const invalidScreenIds = screenIds.filter((screenId) => !validScreenIds.has(screenId));
+    if (invalidScreenIds.length) {
+      throw Object.assign(new Error(`Unknown target frames: ${invalidScreenIds.join(", ")}`), { statusCode: 400 });
+    }
+
+    baseSchedule.imageName = imageName;
+    baseSchedule.screenIds = screenIds;
+    if (!baseSchedule.name) {
+      baseSchedule.name = imageName;
+    }
+  } else {
+    const setId = String(input?.setId || "").trim();
+    if (!setId) {
+      throw Object.assign(new Error("Choose a wall layout to schedule."), { statusCode: 400 });
+    }
+    const hasSet = (project?.contentLibrary?.sets || []).some((set) => set.id === setId);
+    if (!hasSet) {
+      throw Object.assign(new Error("That wall layout no longer exists."), { statusCode: 400 });
+    }
+    baseSchedule.setId = setId;
+    if (!baseSchedule.name) {
+      baseSchedule.name = "Wall Layout";
+    }
+  }
+
+  if (recurrence === "once") {
+    const runAt = String(input?.runAt || "").trim();
+    const parsed = new Date(runAt);
+    if (!runAt || Number.isNaN(parsed.getTime())) {
+      throw Object.assign(new Error("Choose a valid date and time."), { statusCode: 400 });
+    }
+    baseSchedule.runAt = parsed.toISOString();
+  } else {
+    const startDate = String(input?.startDate || "").trim();
+    const localTime = String(input?.localTime || "").trim();
+    if (!LOCAL_DATE_PATTERN.test(startDate)) {
+      throw Object.assign(new Error("Choose a valid start date."), { statusCode: 400 });
+    }
+    if (!LOCAL_TIME_PATTERN.test(localTime)) {
+      throw Object.assign(new Error("Choose a valid start time."), { statusCode: 400 });
+    }
+
+    baseSchedule.startDate = startDate;
+    baseSchedule.localTime = localTime;
+
+    if (recurrence === "weekly") {
+      const weekday = Number.parseInt(String(input?.weekday ?? ""), 10);
+      if (!Number.isInteger(weekday) || weekday < 0 || weekday > 6) {
+        throw Object.assign(new Error("Choose a valid day for the weekly schedule."), { statusCode: 400 });
+      }
+      baseSchedule.weekday = weekday;
+    }
+  }
+
+  return normalizeStoredContentSchedule(baseSchedule);
+}
+
+function getContentScheduleDueState(schedule, referenceDate = new Date()) {
+  if (!schedule?.enabled) {
+    return { due: false, runKey: "", reason: "disabled" };
+  }
+
+  if (schedule.recurrence === "once") {
+    const runAt = new Date(schedule.runAt);
+    if (Number.isNaN(runAt.getTime())) {
+      return { due: false, runKey: "", reason: "invalid" };
+    }
+    if (schedule.lastRunAt) {
+      return { due: false, runKey: "", reason: "already-ran" };
+    }
+    return {
+      due: runAt.getTime() <= referenceDate.getTime(),
+      runKey: "once",
+      reason: runAt.getTime() <= referenceDate.getTime() ? "ready" : "future"
+    };
+  }
+
+  if (!LOCAL_DATE_PATTERN.test(schedule.startDate) || !LOCAL_TIME_PATTERN.test(schedule.localTime)) {
+    return { due: false, runKey: "", reason: "invalid" };
+  }
+
+  const todayKey = createLocalDateKey(referenceDate);
+  if (todayKey < schedule.startDate) {
+    return { due: false, runKey: todayKey, reason: "before-start" };
+  }
+
+  if (schedule.recurrence === "weekly" && referenceDate.getDay() !== schedule.weekday) {
+    return { due: false, runKey: todayKey, reason: "wrong-day" };
+  }
+
+  const scheduledMinutes = parseLocalTimeMinutes(schedule.localTime);
+  if (scheduledMinutes == null) {
+    return { due: false, runKey: todayKey, reason: "invalid" };
+  }
+
+  if (schedule.lastRunKey === todayKey) {
+    return { due: false, runKey: todayKey, reason: "already-ran" };
+  }
+
+  const currentMinutes = getCurrentLocalMinutes(referenceDate);
+  return {
+    due: currentMinutes >= scheduledMinutes,
+    runKey: todayKey,
+    reason: currentMinutes >= scheduledMinutes ? "ready" : "future"
+  };
+}
+
+function createContentScheduleRuntimePatch(schedule, { runKey, jobId = "", status, error = "" }) {
+  return {
+    ...schedule,
+    enabled: schedule.recurrence === "once" ? false : schedule.enabled,
+    updatedAt: nowIso(),
+    lastRunAt: nowIso(),
+    lastRunKey: runKey || schedule.lastRunKey || "",
+    lastJobId: jobId || "",
+    lastStatus: status,
+    lastError: error || ""
+  };
+}
 
 function orientationFromRatio(ratio) {
   if (!Number.isFinite(ratio) || ratio <= 0) {
@@ -126,6 +455,13 @@ function editCachePathFor(imageName) {
   return path.join(editCacheDir, imageName);
 }
 
+function getCanonicalEditTarget(project) {
+  return project?.screens?.find((screen) => screen.enabled && screen.size?.width && screen.size?.height)
+    || project?.screens?.find((screen) => screen.size?.width && screen.size?.height)
+    || DEFAULT_PROJECT.screens[0]
+    || null;
+}
+
 async function resolveContentImagePath(project, imageName) {
   if (path.basename(imageName) !== imageName) {
     throw Object.assign(new Error(`Invalid image name: ${imageName}`), { statusCode: 400 });
@@ -142,9 +478,7 @@ async function resolveContentImagePath(project, imageName) {
     await fs.promises.access(cachePath, fs.constants.R_OK);
     return cachePath;
   } catch {}
-  const targetScreen = editRecipe.targetScreenId
-    ? project.screens.find((screen) => screen.id === editRecipe.targetScreenId)
-    : null;
+  const targetScreen = getCanonicalEditTarget(project);
   const buffer = await applyEditRecipe(sourcePath, editRecipe, {
     targetWidth: targetScreen?.size?.width || null,
     targetHeight: targetScreen?.size?.height || null,
@@ -169,11 +503,290 @@ function findScreenById(screenId) {
   return loadProjectFromStore().screens.find((screen) => screen.id === screenId) || null;
 }
 
+function getWallSortWeight(slot) {
+  if (slot === "left") return 0;
+  if (slot === "center") return 1;
+  if (slot === "right") return 2;
+  return 99;
+}
+
+function getDefaultSetSlot(index, total) {
+  if (total === 1) return "center";
+  if (total === 2) return ["left", "right"][index] || "";
+  if (total === 3) return ["left", "center", "right"][index] || "";
+  return "";
+}
+
+function getWallScreensBySlot(project, wallId, { enabledOnly = false } = {}) {
+  return (project?.screens || [])
+    .filter((screen) => screen.wallId === wallId && (!enabledOnly || screen.enabled))
+    .sort((a, b) => {
+      const weightDiff = getWallSortWeight(a.wallSlot) - getWallSortWeight(b.wallSlot);
+      if (weightDiff !== 0) {
+        return weightDiff;
+      }
+      return String(a.name || "").localeCompare(String(b.name || ""));
+    });
+}
+
+function getContentSetMappingsForProject(project, set, { enabledOnly = false } = {}) {
+  const items = Array.isArray(set?.items)
+    ? [...set.items]
+        .map((item, index) => ({
+          imageName: String(item?.imageName || "").trim(),
+          position: Number.isFinite(item?.position) ? Number(item.position) : index + 1,
+          slot: String(item?.slot || "").trim()
+        }))
+        .filter((item) => item.imageName)
+        .sort((a, b) => a.position - b.position)
+        .map((item, index, all) => ({
+          ...item,
+          position: index + 1,
+          slot: item.slot || getDefaultSetSlot(index, all.length)
+        }))
+    : [];
+
+  const wallId = String(set?.wallId || "").trim();
+  const wallScreens = wallId ? getWallScreensBySlot(project, wallId, { enabledOnly }) : [];
+  const usedScreenIds = new Set();
+  const mappings = items.map((item, index) => {
+    const slot = item.slot || getDefaultSetSlot(index, items.length);
+    const targetScreen = slot
+      ? wallScreens.find((screen) => screen.wallSlot === slot && !usedScreenIds.has(screen.id)) || null
+      : wallScreens.find((screen) => !usedScreenIds.has(screen.id)) || null;
+    if (targetScreen) {
+      usedScreenIds.add(targetScreen.id);
+    }
+    return {
+      item,
+      slot,
+      targetScreen
+    };
+  });
+
+  const issues = [];
+  if (!wallId) {
+    issues.push("Choose a target wall for this set.");
+  }
+  if (!items.length) {
+    issues.push("Set has no items.");
+  }
+
+  for (const mapping of mappings) {
+    if (mapping.targetScreen) {
+      continue;
+    }
+    if (mapping.slot) {
+      issues.push(`${mapping.slot} slot is not available on the selected wall.`);
+    } else {
+      issues.push(`Position ${mapping.item.position} does not have an available frame on the selected wall.`);
+    }
+  }
+
+  return {
+    mappings,
+    issues,
+    canSend: Boolean(wallId) && mappings.length > 0 && issues.length === 0
+  };
+}
+
+function createSendJobDispatch({ imageName, screens, execute }) {
+  const job = createSendJob({
+    imageName,
+    screens
+  });
+
+  markSendJobRunning(job.id);
+
+  void (async () => {
+    try {
+      const results = await execute({
+        onProgress: (screen, event) => {
+          recordSendJobEvent(job.id, screen.id, event);
+        }
+      });
+
+      for (const result of results) {
+        completeSendJobTarget(job.id, result.screenId, result);
+      }
+      recordSentImages(results);
+
+      const finalJob = getSendJob(job.id);
+      const hasUnverified = finalJob?.targets.some((target) => target.status === "unverified");
+      if (hasUnverified) {
+        failSendJob(job.id, "One or more frames did not confirm image receipt. Try waking the display and sending again.");
+      } else {
+        finishSendJob(job.id);
+      }
+    } catch (error) {
+      failSendJob(job.id, error.message || "Send failed.");
+    }
+  })();
+
+  return job;
+}
+
+async function queueImageSend({ project, imageName, screenIds }) {
+  const normalizedName = String(imageName || "").trim();
+  if (!normalizedName) {
+    throw Object.assign(new Error("imageName is required."), { statusCode: 400 });
+  }
+  if (path.basename(normalizedName) !== normalizedName) {
+    throw Object.assign(new Error("Invalid image path."), { statusCode: 400 });
+  }
+
+  const uniqueScreenIds = [...new Set((Array.isArray(screenIds) ? screenIds : []).map((id) => String(id || "").trim()).filter(Boolean))];
+  if (!uniqueScreenIds.length) {
+    throw Object.assign(new Error("No target devices selected."), { statusCode: 400 });
+  }
+
+  const screens = (project?.screens || []).filter((screen) => uniqueScreenIds.includes(screen.id) && screen.enabled);
+  const missing = uniqueScreenIds.filter((id) => !screens.some((screen) => screen.id === id));
+  if (missing.length) {
+    throw Object.assign(new Error(`Unknown screen ids: ${missing.join(", ")}`), { statusCode: 400 });
+  }
+
+  const imagePath = await resolveContentImagePath(project, normalizedName);
+  return createSendJobDispatch({
+    imageName: normalizedName,
+    screens,
+    execute: ({ onProgress }) => sendImageToScreens({
+      screens,
+      imagePath,
+      onProgress
+    })
+  });
+}
+
+async function queueSetSend({ project, setId, screenIds = [] }) {
+  const normalizedSetId = String(setId || "").trim();
+  if (!normalizedSetId) {
+    throw Object.assign(new Error("setId is required."), { statusCode: 400 });
+  }
+
+  const set = (project?.contentLibrary?.sets || []).find((entry) => entry.id === normalizedSetId);
+  if (!set) {
+    throw Object.assign(new Error(`Set not found: ${normalizedSetId}`), { statusCode: 404 });
+  }
+
+  const items = Array.isArray(set.items)
+    ? [...set.items].sort((a, b) => a.position - b.position)
+    : [];
+  if (!items.length) {
+    throw Object.assign(new Error("Set has no items."), { statusCode: 400 });
+  }
+
+  let screens = [];
+  const imagePathByScreenId = {};
+
+  if (Array.isArray(screenIds) && screenIds.length) {
+    const requestedIds = screenIds.map((id) => String(id || "").trim()).filter(Boolean);
+    if (requestedIds.length !== items.length) {
+      throw Object.assign(new Error(`Expected ${items.length} screenIds, got ${requestedIds.length}.`), { statusCode: 400 });
+    }
+
+    for (let index = 0; index < items.length; index += 1) {
+      const screenId = requestedIds[index];
+      const screen = (project?.screens || []).find((entry) => entry.id === screenId && entry.enabled);
+      if (!screen) {
+        throw Object.assign(new Error(`Unknown or disabled screen: ${screenId}`), { statusCode: 400 });
+      }
+      if (screens.some((entry) => entry.id === screen.id)) {
+        throw Object.assign(new Error(`Screen ${screen.id} is mapped to multiple positions.`), { statusCode: 400 });
+      }
+
+      screens.push(screen);
+      imagePathByScreenId[screen.id] = await resolveContentImagePath(project, items[index].imageName);
+    }
+  } else {
+    const mapping = getContentSetMappingsForProject(project, set, { enabledOnly: true });
+    if (!mapping.canSend) {
+      throw Object.assign(new Error(mapping.issues[0] || "Finish the wall mapping before sending this set."), { statusCode: 400 });
+    }
+
+    for (const entry of mapping.mappings) {
+      screens.push(entry.targetScreen);
+      imagePathByScreenId[entry.targetScreen.id] = await resolveContentImagePath(project, entry.item.imageName);
+    }
+  }
+
+  return createSendJobDispatch({
+    imageName: `Set: ${set.name}`,
+    screens,
+    execute: ({ onProgress }) => sendImagesToScreens({
+      screens,
+      imagePathByScreenId,
+      onProgress
+    })
+  });
+}
+
+async function executeDueContentSchedules() {
+  const schedules = listContentSchedules();
+  if (!schedules.length) {
+    return;
+  }
+  for (const schedule of schedules) {
+    const dueState = getContentScheduleDueState(schedule);
+    if (!dueState.due) {
+      continue;
+    }
+
+    try {
+      const latest = getContentScheduleById(schedule.id);
+      if (!latest) {
+        continue;
+      }
+      const latestDueState = getContentScheduleDueState(latest);
+      if (!latestDueState.due) {
+        continue;
+      }
+
+      const project = loadProjectFromStore();
+      const job = latest.kind === "set"
+        ? await queueSetSend({ project, setId: latest.setId })
+        : await queueImageSend({ project, imageName: latest.imageName, screenIds: latest.screenIds });
+
+      updateContentScheduleRecord(latest.id, (current) => createContentScheduleRuntimePatch(current, {
+        runKey: latestDueState.runKey,
+        jobId: job.id,
+        status: "queued"
+      }));
+    } catch (error) {
+      updateContentScheduleRecord(schedule.id, (current) => createContentScheduleRuntimePatch(current, {
+        runKey: dueState.runKey,
+        status: "failed",
+        error: error.message || "Schedule failed."
+      }));
+    }
+  }
+}
+
 export async function startAppServer({ host = env.appHost, port = env.appPort } = {}) {
   getDb();
+  let schedulePollRunning = false;
+
+  const pollDueSchedules = async () => {
+    if (schedulePollRunning) {
+      return;
+    }
+    schedulePollRunning = true;
+    try {
+      await executeDueContentSchedules();
+    } catch (error) {
+      console.error("[content-schedules] poll failed:", error.message);
+    } finally {
+      schedulePollRunning = false;
+    }
+  };
 
   const app = express();
   app.use(express.json({ limit: "2mb" }));
+
+  void pollDueSchedules();
+  setInterval(() => {
+    void pollDueSchedules();
+  }, 30000);
 
   app.get("/api/health", (req, res) => {
     res.json({ ok: true });
@@ -185,6 +798,58 @@ export async function startAppServer({ host = env.appHost, port = env.appPort } 
 
   app.get("/api/device-state", (req, res) => {
     res.json(loadDeviceStateFromStore());
+  });
+
+  app.get("/api/content/schedules", (req, res) => {
+    res.json(listContentSchedules());
+  });
+
+  app.post("/api/content/schedules", (req, res) => {
+    try {
+      const schedule = validateContentScheduleInput({
+        ...req.body,
+        id: crypto.randomUUID()
+      });
+      saveContentSchedules([...listContentSchedules(), schedule]);
+      res.status(201).json(schedule);
+    } catch (error) {
+      res.status(error.statusCode || 500).json({ error: error.message });
+    }
+  });
+
+  app.put("/api/content/schedules/:scheduleId", (req, res) => {
+    try {
+      const current = getContentScheduleById(req.params.scheduleId);
+      if (!current) {
+        res.status(404).json({ error: "Schedule not found." });
+        return;
+      }
+
+      const nextSchedule = validateContentScheduleInput({
+        ...current,
+        ...req.body,
+        id: current.id,
+        createdAt: current.createdAt,
+        lastRunAt: current.lastRunAt,
+        lastRunKey: current.lastRunKey,
+        lastJobId: current.lastStatus === "failed" ? "" : current.lastJobId,
+        lastStatus: current.lastStatus === "failed" ? "" : current.lastStatus,
+        lastError: ""
+      }, { currentId: current.id });
+      const saved = upsertContentSchedule(current.id, nextSchedule);
+      res.json(saved);
+    } catch (error) {
+      res.status(error.statusCode || 500).json({ error: error.message });
+    }
+  });
+
+  app.delete("/api/content/schedules/:scheduleId", (req, res) => {
+    const deleted = deleteContentScheduleRecord(req.params.scheduleId);
+    if (!deleted) {
+      res.status(404).json({ error: "Schedule not found." });
+      return;
+    }
+    res.json({ ok: true, deleted });
   });
 
   app.post("/api/devices/discover", async (req, res) => {
@@ -382,6 +1047,42 @@ export async function startAppServer({ host = env.appHost, port = env.appPort } 
     }
   });
 
+  app.get("/api/content/items/:imageName/preview", async (req, res) => {
+    try {
+      const imageName = String(req.params.imageName || "").trim();
+      if (!imageName || path.basename(imageName) !== imageName) {
+        res.status(400).json({ error: "Invalid image name." });
+        return;
+      }
+
+      const sourcePath = path.resolve(outputDir, imageName);
+      if (!sourcePath.startsWith(path.resolve(outputDir) + path.sep)) {
+        res.status(400).json({ error: "Invalid image path." });
+        return;
+      }
+      await fs.promises.access(sourcePath, fs.constants.R_OK);
+
+      const project = loadProjectFromStore();
+      const targetScreen = getCanonicalEditTarget(project);
+      let rawRecipe = null;
+      if (typeof req.query.recipe === "string" && req.query.recipe.trim()) {
+        rawRecipe = JSON.parse(req.query.recipe);
+      }
+
+      const buffer = await applyEditRecipe(sourcePath, rawRecipe, {
+        targetWidth: targetScreen?.size?.width || null,
+        targetHeight: targetScreen?.size?.height || null,
+        outputFormat: "png"
+      });
+
+      res.setHeader("Content-Type", "image/png");
+      res.setHeader("Cache-Control", "no-store");
+      res.send(buffer);
+    } catch (error) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
   app.put("/api/content/items/:imageName/edit", async (req, res) => {
     try {
       const imageName = String(req.params.imageName || "").trim();
@@ -402,9 +1103,7 @@ export async function startAppServer({ host = env.appHost, port = env.appPort } 
       const normalized = normalizeEditRecipe(rawRecipe);
 
       const project = loadProjectFromStore();
-      const targetScreen = normalized?.targetScreenId
-        ? project.screens.find((screen) => screen.id === normalized.targetScreenId)
-        : null;
+      const targetScreen = getCanonicalEditTarget(project);
       const targetWidth = targetScreen?.size?.width || null;
       const targetHeight = targetScreen?.size?.height || null;
 
@@ -479,202 +1178,42 @@ export async function startAppServer({ host = env.appHost, port = env.appPort } 
 
   app.post("/api/content/send", async (req, res) => {
     try {
-      const imageName = String(req.body.imageName || "").trim();
-      const requestedIds = Array.isArray(req.body.screenIds) ? req.body.screenIds : [];
-
-      if (!imageName) {
-        res.status(400).json({ error: "imageName is required." });
-        return;
-      }
-
-      if (path.basename(imageName) !== imageName) {
-        res.status(400).json({ error: "Invalid image name." });
-        return;
-      }
-
-      const sourcePath = path.resolve(outputDir, imageName);
-      if (!sourcePath.startsWith(path.resolve(outputDir) + path.sep)) {
-        res.status(400).json({ error: "Invalid image path." });
-        return;
-      }
-
-      await fs.promises.access(sourcePath, fs.constants.R_OK);
-
       const project = loadProjectFromStore();
-
-      let imagePath = sourcePath;
-      const editRecipe = project.contentLibrary?.items?.[imageName]?.editRecipe || null;
-      if (editRecipe) {
-        const cachePath = editCachePathFor(imageName);
-        try {
-          await fs.promises.access(cachePath, fs.constants.R_OK);
-          imagePath = cachePath;
-        } catch {
-          const targetScreen = editRecipe.targetScreenId
-            ? project.screens.find((screen) => screen.id === editRecipe.targetScreenId)
-            : null;
-          const buffer = await applyEditRecipe(sourcePath, editRecipe, {
-            targetWidth: targetScreen?.size?.width || null,
-            targetHeight: targetScreen?.size?.height || null,
-            outputFormat: path.extname(imageName).slice(1)
-          });
-          await writeEditCache(cachePath, buffer);
-          imagePath = cachePath;
-        }
-      }
-
-      const screens = project.screens.filter((screen) => requestedIds.includes(screen.id) && screen.enabled);
-      const missing = requestedIds.filter((id) => !screens.some((screen) => screen.id === id));
-
-      if (missing.length) {
-        res.status(400).json({ error: `Unknown screen ids: ${missing.join(", ")}` });
-        return;
-      }
-
-      if (!screens.length) {
-        res.status(400).json({ error: "No target devices selected." });
-        return;
-      }
-
-      const job = createSendJob({
-        imageName,
-        screens
+      const job = await queueImageSend({
+        project,
+        imageName: req.body.imageName,
+        screenIds: req.body.screenIds
       });
-
-      markSendJobRunning(job.id);
-
-      void (async () => {
-        try {
-          const results = await sendImageToScreens({
-            screens,
-            imagePath,
-            onProgress: (screen, event) => {
-              recordSendJobEvent(job.id, screen.id, event);
-            }
-          });
-
-          for (const result of results) {
-            completeSendJobTarget(job.id, result.screenId, result);
-          }
-          recordSentImages(results);
-
-          const finalJob = getSendJob(job.id);
-          const hasUnverified = finalJob?.targets.some((t) => t.status === "unverified");
-          if (hasUnverified) {
-            failSendJob(job.id, "One or more frames did not confirm image receipt. Try waking the display and sending again.");
-          } else {
-            finishSendJob(job.id);
-          }
-        } catch (error) {
-          failSendJob(job.id, error.message || "Send failed.");
-        }
-      })();
 
       res.status(202).json({
         ok: true,
-        imageName,
+        imageName: String(req.body.imageName || "").trim(),
         jobId: job.id
       });
     } catch (error) {
-      res.status(500).json({ error: error.message });
+      res.status(error.statusCode || 500).json({ error: error.message });
     }
   });
 
   app.post("/api/content/send-set", async (req, res) => {
     try {
-      const setId = String(req.body.setId || "").trim();
-      const requestedIds = Array.isArray(req.body.screenIds) ? req.body.screenIds : [];
-
-      if (!setId) {
-        res.status(400).json({ error: "setId is required." });
-        return;
-      }
-
       const project = loadProjectFromStore();
+      const setId = String(req.body.setId || "").trim();
       const set = (project.contentLibrary?.sets || []).find((entry) => entry.id === setId);
-      if (!set) {
-        res.status(404).json({ error: `Set not found: ${setId}` });
-        return;
-      }
-
-      const positions = [...(set.items || [])].sort((a, b) => a.position - b.position);
-      if (!positions.length) {
-        res.status(400).json({ error: "Set has no items." });
-        return;
-      }
-
-      if (requestedIds.length !== positions.length) {
-        res.status(400).json({ error: `Expected ${positions.length} screenIds, got ${requestedIds.length}.` });
-        return;
-      }
-
-      const screens = [];
-      const imagePathByScreenId = {};
-      for (let i = 0; i < positions.length; i += 1) {
-        const screenId = requestedIds[i];
-        const screen = project.screens.find((entry) => entry.id === screenId && entry.enabled);
-        if (!screen) {
-          res.status(400).json({ error: `Unknown or disabled screen: ${screenId}` });
-          return;
-        }
-        if (screens.some((entry) => entry.id === screen.id)) {
-          res.status(400).json({ error: `Screen ${screen.id} is mapped to multiple positions.` });
-          return;
-        }
-        let imagePath;
-        try {
-          imagePath = await resolveContentImagePath(project, positions[i].imageName);
-        } catch (err) {
-          const status = err.statusCode || 500;
-          res.status(status).json({ error: err.message });
-          return;
-        }
-        screens.push(screen);
-        imagePathByScreenId[screen.id] = imagePath;
-      }
-
-      const job = createSendJob({
-        imageName: `Set: ${set.name}`,
-        screens
+      const job = await queueSetSend({
+        project,
+        setId,
+        screenIds: req.body.screenIds
       });
-
-      markSendJobRunning(job.id);
-
-      void (async () => {
-        try {
-          const results = await sendImagesToScreens({
-            screens,
-            imagePathByScreenId,
-            onProgress: (screen, event) => {
-              recordSendJobEvent(job.id, screen.id, event);
-            }
-          });
-
-          for (const result of results) {
-            completeSendJobTarget(job.id, result.screenId, result);
-          }
-          recordSentImages(results);
-
-          const finalJob = getSendJob(job.id);
-          const hasUnverified = finalJob?.targets.some((t) => t.status === "unverified");
-          if (hasUnverified) {
-            failSendJob(job.id, "One or more frames did not confirm image receipt. Try waking the display and sending again.");
-          } else {
-            finishSendJob(job.id);
-          }
-        } catch (error) {
-          failSendJob(job.id, error.message || "Send failed.");
-        }
-      })();
 
       res.status(202).json({
         ok: true,
         setId,
-        setName: set.name,
+        setName: set?.name || "Set",
         jobId: job.id
       });
     } catch (error) {
-      res.status(500).json({ error: error.message });
+      res.status(error.statusCode || 500).json({ error: error.message });
     }
   });
 

@@ -7,6 +7,9 @@ import { normalizeMusicAlbum } from "./template-utils.js";
 const STORAGE_KEY = "poster-wall-project-v3";
 const UI_STORAGE_KEY = "poster-wall-ui-v1";
 const SPOTIFY_ARTIST_ALBUM_PAGE_SIZE = 10;
+const CONTENT_SCHEDULE_RECURRENCES = new Set(["once", "daily", "weekly"]);
+const CONTENT_SCHEDULE_KINDS = new Set(["image", "set"]);
+const WEEKDAY_LABELS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
 const app = document.getElementById("app");
 let sendFlowPollTimer = null;
 
@@ -18,6 +21,7 @@ const state = {
   deviceDiagnostics: {},
   outputImages: [],
   outputDirectory: "",
+  contentSchedules: [],
   actions: {
     notice: "",
     error: ""
@@ -45,6 +49,8 @@ const state = {
     contentManageMode: false,
     contentManageSelections: [],
     contentEdit: null,
+    contentSetEditorId: "",
+    contentScheduleDraft: null,
     sendFlow: null,
     spotifySettingsDraft: null
   },
@@ -97,12 +103,13 @@ init().catch((error) => {
 });
 
 async function init() {
-  const [catalog, project, deviceState, outputPayload, spotifySettings] = await Promise.all([
+  const [catalog, project, deviceState, outputPayload, spotifySettings, contentSchedules] = await Promise.all([
     loadCatalog(),
     loadProject(),
     loadDeviceState(),
     loadOutputImages(),
-    loadSpotifySettings()
+    loadSpotifySettings(),
+    loadContentSchedules()
   ]);
   state.catalog = catalog;
   state.project = normalizeProject(project);
@@ -110,6 +117,7 @@ async function init() {
   state.outputImages = outputPayload.images || [];
   state.outputDirectory = outputPayload.directory || "";
   state.spotifySettings = normalizeSpotifySettings(spotifySettings);
+  state.contentSchedules = normalizeContentSchedules(contentSchedules);
   applyStoredUiState();
   const initialSlugs = new Set(state.project.screens.map((screen) => screen.albumSlug).filter(Boolean));
   if (state.ui.section === "studio" && state.ui.studioView === "workspace" && state.ui.studioPluginId === "album-art-generator") {
@@ -257,6 +265,21 @@ async function loadOutputImages() {
     return await apiGetJson("/api/output-images");
   } catch {
     return { directory: "", images: [] };
+  }
+}
+
+async function loadContentSchedules() {
+  try {
+    return await apiGetJson("/api/content/schedules");
+  } catch {
+    return [];
+  }
+}
+
+async function refreshContentSchedules({ render = true } = {}) {
+  state.contentSchedules = normalizeContentSchedules(await loadContentSchedules());
+  if (render) {
+    renderWorkspace();
   }
 }
 
@@ -799,11 +822,15 @@ const EDIT_RECIPE_DEFAULTS = Object.freeze({
   fit: "contain",
   cropAnchor: "center",
   rotate: 0,
+  zoom: 1,
+  panX: 0,
+  panY: 0,
   grayscale: false,
   invert: false,
   brightness: 1,
   contrast: 1,
   gamma: 1,
+  vibrance: 1,
   sharpen: 0,
   blur: 0,
   blackPoint: 0,
@@ -814,6 +841,7 @@ const EDIT_RECIPE_DEFAULTS = Object.freeze({
 const EDIT_FIT_MODES = new Set(["contain", "cover"]);
 const EDIT_CROP_ANCHORS = new Set(["center", "top", "bottom", "left", "right"]);
 const EDIT_ROTATIONS = new Set([0, 90, 180, 270]);
+const CONTENT_SET_SLOTS = new Set(["left", "center", "right"]);
 
 function clampNumber(value, min, max) {
   if (!Number.isFinite(value)) {
@@ -834,11 +862,15 @@ function isDefaultEditRecipe(recipe) {
     recipe.fit === EDIT_RECIPE_DEFAULTS.fit &&
     recipe.cropAnchor === EDIT_RECIPE_DEFAULTS.cropAnchor &&
     recipe.rotate === EDIT_RECIPE_DEFAULTS.rotate &&
+    recipe.zoom === EDIT_RECIPE_DEFAULTS.zoom &&
+    recipe.panX === EDIT_RECIPE_DEFAULTS.panX &&
+    recipe.panY === EDIT_RECIPE_DEFAULTS.panY &&
     recipe.grayscale === EDIT_RECIPE_DEFAULTS.grayscale &&
     recipe.invert === EDIT_RECIPE_DEFAULTS.invert &&
     recipe.brightness === EDIT_RECIPE_DEFAULTS.brightness &&
     recipe.contrast === EDIT_RECIPE_DEFAULTS.contrast &&
     recipe.gamma === EDIT_RECIPE_DEFAULTS.gamma &&
+    recipe.vibrance === EDIT_RECIPE_DEFAULTS.vibrance &&
     recipe.sharpen === EDIT_RECIPE_DEFAULTS.sharpen &&
     recipe.blur === EDIT_RECIPE_DEFAULTS.blur &&
     recipe.blackPoint === EDIT_RECIPE_DEFAULTS.blackPoint &&
@@ -854,24 +886,55 @@ function normalizeEditRecipe(input) {
   const fit = EDIT_FIT_MODES.has(input.fit) ? input.fit : EDIT_RECIPE_DEFAULTS.fit;
   const cropAnchor = EDIT_CROP_ANCHORS.has(input.cropAnchor) ? input.cropAnchor : EDIT_RECIPE_DEFAULTS.cropAnchor;
   const rotate = EDIT_ROTATIONS.has(Number(input.rotate)) ? Number(input.rotate) : EDIT_RECIPE_DEFAULTS.rotate;
+  const zoom = clampNumber(Number(input.zoom), 1, 3) ?? EDIT_RECIPE_DEFAULTS.zoom;
+  const panX = clampNumber(Number(input.panX), -1, 1) ?? EDIT_RECIPE_DEFAULTS.panX;
+  const panY = clampNumber(Number(input.panY), -1, 1) ?? EDIT_RECIPE_DEFAULTS.panY;
   const grayscale = Boolean(input.grayscale);
   const invert = Boolean(input.invert);
   const brightness = clampNumber(Number(input.brightness), 0.5, 1.5) ?? EDIT_RECIPE_DEFAULTS.brightness;
   const contrast = clampNumber(Number(input.contrast), 0.5, 1.5) ?? EDIT_RECIPE_DEFAULTS.contrast;
   const gamma = clampNumber(Number(input.gamma), 1, 3) ?? EDIT_RECIPE_DEFAULTS.gamma;
+  const vibrance = clampNumber(Number(input.vibrance), 0.5, 1.8) ?? EDIT_RECIPE_DEFAULTS.vibrance;
   const sharpen = clampNumber(Number(input.sharpen), 0, 5) ?? EDIT_RECIPE_DEFAULTS.sharpen;
   const blur = clampNumber(Number(input.blur), 0, 5) ?? EDIT_RECIPE_DEFAULTS.blur;
   const blackPoint = clampNumber(Number(input.blackPoint), 0, 0.4) ?? EDIT_RECIPE_DEFAULTS.blackPoint;
   const whitePoint = clampNumber(Number(input.whitePoint), 0.6, 1) ?? EDIT_RECIPE_DEFAULTS.whitePoint;
-  const targetScreenId = typeof input.targetScreenId === "string" && input.targetScreenId.trim()
-    ? input.targetScreenId.trim()
-    : null;
+  const targetScreenId = null;
   const recipe = {
-    fit, cropAnchor, rotate, grayscale, invert, brightness, contrast,
-    gamma, sharpen, blur, blackPoint, whitePoint, targetScreenId,
+    fit, cropAnchor, rotate, zoom, panX, panY, grayscale, invert, brightness, contrast,
+    gamma, vibrance, sharpen, blur, blackPoint, whitePoint, targetScreenId,
     updatedAt: typeof input.updatedAt === "string" && input.updatedAt ? input.updatedAt : new Date().toISOString()
   };
   return isDefaultEditRecipe(recipe) ? null : recipe;
+}
+
+function getCanonicalContentTargetScreen() {
+  return state.project?.screens?.find((screen) => screen.enabled && screen.size?.width && screen.size?.height)
+    || state.project?.screens?.find((screen) => screen.size?.width && screen.size?.height)
+    || DEFAULT_PROJECT.screens[0]
+    || null;
+}
+
+function buildContentEditPreviewUrl(imageName, draft, modifiedAt = "") {
+  const encodedName = encodeURIComponent(imageName);
+  const recipe = {
+    ...getDefaultEditRecipe(),
+    ...(draft || {}),
+    targetScreenId: null
+  };
+  const recipeParam = encodeURIComponent(JSON.stringify(recipe));
+  const stamp = encodeURIComponent(`${modifiedAt}-${recipe.updatedAt || ""}`);
+  return `/api/content/items/${encodedName}/preview?recipe=${recipeParam}&t=${stamp}`;
+}
+
+function buildSavedContentPreviewUrl(image) {
+  if (!image?.name) {
+    return "";
+  }
+  const recipe = image.editRecipe
+    ? { ...getDefaultEditRecipe(), ...image.editRecipe, targetScreenId: null }
+    : null;
+  return buildContentEditPreviewUrl(image.name, recipe, image.modifiedAt || "");
 }
 
 function normalizeContentLibrary(contentLibrary = {}) {
@@ -902,20 +965,30 @@ function normalizeContentLibrary(contentLibrary = {}) {
 
   const sets = Array.isArray(contentLibrary.sets)
     ? contentLibrary.sets
-        .map((set) => ({
-          id: createLocationId(set.id || set.name || crypto.randomUUID()),
-          name: String(set.name || "").trim(),
-          collectionId: collectionIds.has(set.collectionId) ? set.collectionId : "",
-          items: Array.isArray(set.items)
+        .map((set) => {
+          const rawItems = Array.isArray(set.items)
             ? set.items
                 .map((item, index) => ({
                   imageName: String(item?.imageName || "").trim(),
-                  position: Number.isFinite(item?.position) ? Number(item.position) : index + 1
+                  position: Number.isFinite(item?.position) ? Number(item.position) : index + 1,
+                  slot: CONTENT_SET_SLOTS.has(String(item?.slot || "").trim()) ? String(item.slot).trim() : ""
                 }))
                 .filter((item) => item.imageName)
                 .sort((a, b) => a.position - b.position)
-            : []
-        }))
+            : [];
+          const items = rawItems.map((item, index) => ({
+            ...item,
+            position: index + 1,
+            slot: item.slot || getDefaultContentSetSlot(index, rawItems.length)
+          }));
+          return {
+            id: createLocationId(set.id || set.name || crypto.randomUUID()),
+            name: String(set.name || "").trim(),
+            collectionId: collectionIds.has(set.collectionId) ? set.collectionId : "",
+            wallId: String(set.wallId || "").trim(),
+            items
+          };
+        })
         .filter((set) => set.name)
     : [];
 
@@ -924,6 +997,257 @@ function normalizeContentLibrary(contentLibrary = {}) {
     sets,
     items
   };
+}
+
+function normalizeContentSchedules(schedules = []) {
+  return Array.isArray(schedules)
+    ? schedules
+        .map((schedule) => {
+          const kind = CONTENT_SCHEDULE_KINDS.has(String(schedule?.kind || "").trim()) ? String(schedule.kind).trim() : "image";
+          const recurrence = CONTENT_SCHEDULE_RECURRENCES.has(String(schedule?.recurrence || "").trim())
+            ? String(schedule.recurrence).trim()
+            : "once";
+          return {
+            id: String(schedule?.id || "").trim(),
+            name: String(schedule?.name || "").trim(),
+            kind,
+            recurrence,
+            enabled: schedule?.enabled !== false,
+            imageName: kind === "image" ? String(schedule?.imageName || "").trim() : "",
+            screenIds: kind === "image" && Array.isArray(schedule?.screenIds)
+              ? [...new Set(schedule.screenIds.map((id) => String(id || "").trim()).filter(Boolean))]
+              : [],
+            setId: kind === "set" ? String(schedule?.setId || "").trim() : "",
+            runAt: recurrence === "once" ? String(schedule?.runAt || "").trim() : "",
+            startDate: recurrence === "once" ? "" : String(schedule?.startDate || "").trim(),
+            localTime: recurrence === "once" ? "" : String(schedule?.localTime || "").trim(),
+            weekday: recurrence === "weekly" && Number.isInteger(schedule?.weekday) ? Number(schedule.weekday) : null,
+            timeZone: String(schedule?.timeZone || "").trim(),
+            createdAt: String(schedule?.createdAt || "").trim(),
+            updatedAt: String(schedule?.updatedAt || "").trim(),
+            lastRunAt: String(schedule?.lastRunAt || "").trim(),
+            lastRunKey: String(schedule?.lastRunKey || "").trim(),
+            lastJobId: String(schedule?.lastJobId || "").trim(),
+            lastStatus: String(schedule?.lastStatus || "").trim(),
+            lastError: String(schedule?.lastError || "").trim()
+          };
+        })
+        .filter((schedule) => schedule.id)
+    : [];
+}
+
+function getContentScheduleById(scheduleId) {
+  return state.contentSchedules.find((schedule) => schedule.id === scheduleId) || null;
+}
+
+function getDefaultScheduleDateTimeLocal() {
+  const next = new Date(Date.now() + (60 * 60 * 1000));
+  next.setMinutes(Math.ceil(next.getMinutes() / 15) * 15, 0, 0);
+  return toLocalDateTimeValue(next);
+}
+
+function toLocalDateTimeValue(date) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  const hours = String(date.getHours()).padStart(2, "0");
+  const minutes = String(date.getMinutes()).padStart(2, "0");
+  return `${year}-${month}-${day}T${hours}:${minutes}`;
+}
+
+function scheduleToDateTimeLocal(schedule) {
+  if (!schedule) {
+    return getDefaultScheduleDateTimeLocal();
+  }
+  if (schedule.recurrence === "once") {
+    const parsed = new Date(schedule.runAt);
+    return Number.isNaN(parsed.getTime()) ? getDefaultScheduleDateTimeLocal() : toLocalDateTimeValue(parsed);
+  }
+  if (schedule.startDate && schedule.localTime) {
+    return `${schedule.startDate}T${schedule.localTime}`;
+  }
+  return getDefaultScheduleDateTimeLocal();
+}
+
+function getDefaultScheduleTimeZone() {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || "America/New_York";
+  } catch {
+    return "America/New_York";
+  }
+}
+
+function buildContentScheduleDraft({
+  id = "",
+  name = "",
+  kind = "image",
+  imageName = "",
+  screenIds = [],
+  setId = "",
+  recurrence = "once",
+  datetimeLocal = "",
+  enabled = true,
+  timeZone = ""
+} = {}) {
+  return {
+    id,
+    name,
+    kind: CONTENT_SCHEDULE_KINDS.has(kind) ? kind : "image",
+    imageName,
+    screenIds: [...new Set(screenIds.filter(Boolean))],
+    setId,
+    recurrence: CONTENT_SCHEDULE_RECURRENCES.has(recurrence) ? recurrence : "once",
+    datetimeLocal: datetimeLocal || getDefaultScheduleDateTimeLocal(),
+    enabled,
+    timeZone: timeZone || getDefaultScheduleTimeZone()
+  };
+}
+
+function createImageScheduleDraft(imageName, screenIds, schedule = null) {
+  return buildContentScheduleDraft({
+    id: schedule?.id || "",
+    name: schedule?.name || imageName,
+    kind: "image",
+    imageName,
+    screenIds,
+    recurrence: schedule?.recurrence || "once",
+    datetimeLocal: scheduleToDateTimeLocal(schedule),
+    enabled: schedule?.enabled ?? true,
+    timeZone: schedule?.timeZone || ""
+  });
+}
+
+function createSetScheduleDraft(set, schedule = null) {
+  return buildContentScheduleDraft({
+    id: schedule?.id || "",
+    name: schedule?.name || set?.name || "Wall Layout",
+    kind: "set",
+    setId: set?.id || schedule?.setId || "",
+    recurrence: schedule?.recurrence || "once",
+    datetimeLocal: scheduleToDateTimeLocal(schedule),
+    enabled: schedule?.enabled ?? true,
+    timeZone: schedule?.timeZone || ""
+  });
+}
+
+function parseScheduleDraft(draft) {
+  const rawDateTime = String(draft?.datetimeLocal || "").trim();
+  if (!rawDateTime) {
+    throw new Error("Choose a date and time first.");
+  }
+
+  const parsed = new Date(rawDateTime);
+  if (Number.isNaN(parsed.getTime())) {
+    throw new Error("Choose a valid date and time.");
+  }
+
+  const [startDate, localTime = ""] = rawDateTime.split("T");
+  const payload = {
+    name: String(draft?.name || "").trim(),
+    kind: draft?.kind,
+    recurrence: draft?.recurrence,
+    enabled: draft?.enabled !== false,
+    timeZone: draft?.timeZone || getDefaultScheduleTimeZone()
+  };
+
+  if (payload.kind === "image") {
+    payload.imageName = String(draft?.imageName || "").trim();
+    payload.screenIds = [...new Set((draft?.screenIds || []).map((id) => String(id || "").trim()).filter(Boolean))];
+  } else {
+    payload.setId = String(draft?.setId || "").trim();
+  }
+
+  if (payload.recurrence === "once") {
+    payload.runAt = parsed.toISOString();
+  } else {
+    payload.startDate = startDate;
+    payload.localTime = localTime;
+    if (payload.recurrence === "weekly") {
+      payload.weekday = parsed.getDay();
+    }
+  }
+
+  return payload;
+}
+
+function getContentScheduleTargetSummary(schedule) {
+  if (schedule.kind === "set") {
+    const set = getContentSetById(schedule.setId);
+    if (!set) {
+      return {
+        title: "Missing wall layout",
+        detail: "The saved set no longer exists."
+      };
+    }
+    const mapping = getContentSetMappings(set, { enabledOnly: true });
+    const wallLabel = mapping.wallContext ? `${mapping.wallContext.room.name} / ${mapping.wallContext.wall.name}` : "No wall assigned";
+    return {
+      title: set.name,
+      detail: wallLabel
+    };
+  }
+
+  const image = getEnrichedOutputImages().find((entry) => entry.name === schedule.imageName)
+    || state.outputImages.find((entry) => entry.name === schedule.imageName);
+  const screens = (schedule.screenIds || [])
+    .map((screenId) => state.project.screens.find((screen) => screen.id === screenId))
+    .filter(Boolean);
+  return {
+    title: image?.name || schedule.imageName || "Missing poster",
+    detail: screens.length
+      ? screens.map((screen) => screen.name).join(", ")
+      : "No active targets saved"
+  };
+}
+
+function formatScheduleDateTime(value) {
+  try {
+    return new Intl.DateTimeFormat(undefined, {
+      month: "short",
+      day: "numeric",
+      hour: "numeric",
+      minute: "2-digit"
+    }).format(new Date(value));
+  } catch {
+    return value;
+  }
+}
+
+function getContentScheduleRecurrenceLabel(schedule) {
+  if (schedule.recurrence === "daily") {
+    return `Daily at ${schedule.localTime}`;
+  }
+  if (schedule.recurrence === "weekly") {
+    return `Weekly on ${WEEKDAY_LABELS[schedule.weekday] || "Selected day"} at ${schedule.localTime}`;
+  }
+  return `Once at ${formatScheduleDateTime(schedule.runAt)}`;
+}
+
+function getContentScheduleNextLabel(schedule) {
+  if (!schedule.enabled) {
+    return "Paused";
+  }
+  if (schedule.recurrence === "once") {
+    return schedule.runAt ? `Runs ${formatScheduleDateTime(schedule.runAt)}` : "Date not set";
+  }
+
+  const startDay = schedule.startDate ? formatDateTime(`${schedule.startDate}T${schedule.localTime || "00:00"}`) : "";
+  return schedule.recurrence === "weekly"
+    ? `Next ${WEEKDAY_LABELS[schedule.weekday] || "week"} at ${schedule.localTime}${startDay ? ` · starts ${startDay}` : ""}`
+    : `Daily at ${schedule.localTime}${startDay ? ` · starts ${startDay}` : ""}`;
+}
+
+function getContentScheduleStatusLabel(schedule) {
+  if (!schedule.enabled) {
+    return "Paused";
+  }
+  if (schedule.lastStatus === "failed") {
+    return "Needs attention";
+  }
+  if (schedule.lastStatus === "queued" && schedule.lastRunAt) {
+    return `Queued ${formatDateTime(schedule.lastRunAt)}`;
+  }
+  return "Active";
 }
 
 function getContentLibrary() {
@@ -1102,7 +1426,12 @@ function createContentSet(name, imageNames) {
     id,
     name: trimmed,
     collectionId: "",
-    items: uniqueNames.map((imageName, index) => ({ imageName, position: index + 1 }))
+    wallId: getDefaultContentSetWallId(uniqueNames.length),
+    items: uniqueNames.map((imageName, index) => ({
+      imageName,
+      position: index + 1,
+      slot: getDefaultContentSetSlot(index, uniqueNames.length)
+    }))
   };
   state.project.contentLibrary.sets = [...(state.project.contentLibrary.sets || []), set];
   state.project.contentLibrary = normalizeContentLibrary(state.project.contentLibrary);
@@ -1121,6 +1450,97 @@ function deleteContentSet(setId) {
 
 function getContentSetById(setId) {
   return (getContentLibrary().sets || []).find((set) => set.id === setId) || null;
+}
+
+function updateContentSet(setId, updater) {
+  const current = getContentSetById(setId);
+  if (!current) {
+    return null;
+  }
+  const nextValue = typeof updater === "function" ? updater(structuredClone(current)) : { ...current, ...(updater || {}) };
+  state.project.contentLibrary.sets = (state.project.contentLibrary.sets || []).map((set) => (set.id === setId ? nextValue : set));
+  state.project.contentLibrary = normalizeContentLibrary(state.project.contentLibrary);
+  return getContentSetById(setId);
+}
+
+function getDefaultContentSetSlot(index, total) {
+  if (total === 1) {
+    return "center";
+  }
+  if (total === 2) {
+    return ["left", "right"][index] || "";
+  }
+  if (total === 3) {
+    return ["left", "center", "right"][index] || "";
+  }
+  return "";
+}
+
+function getAllWallContexts() {
+  return getGroupedScreens().flatMap((room) => room.walls.map((wall) => ({ room, wall })));
+}
+
+function getDefaultContentSetWallId(itemCount) {
+  const candidates = getAllWallContexts().filter(({ wall }) => wall.screens.length >= itemCount);
+  return candidates.length === 1 ? candidates[0].wall.id : "";
+}
+
+function getWallContextById(wallId) {
+  if (!wallId) {
+    return null;
+  }
+  return getAllWallContexts().find((entry) => entry.wall.id === wallId) || null;
+}
+
+function getWallScreensBySlot(wallId, { enabledOnly = false } = {}) {
+  return state.project.screens
+    .filter((screen) => screen.wallId === wallId && (!enabledOnly || screen.enabled))
+    .sort((a, b) => {
+      const slotDiff = getWallSortWeight(a.wallSlot) - getWallSortWeight(b.wallSlot);
+      if (slotDiff !== 0) return slotDiff;
+      return a.name.localeCompare(b.name);
+    });
+}
+
+function getContentSetMappings(set, { enabledOnly = false } = {}) {
+  const items = [...(set?.items || [])].sort((a, b) => a.position - b.position);
+  const wallContext = getWallContextById(set?.wallId || "");
+  const wallScreens = wallContext ? getWallScreensBySlot(wallContext.wall.id, { enabledOnly }) : [];
+  const usedScreenIds = new Set();
+  const mappings = items.map((item, index) => {
+    const slot = item.slot || getDefaultContentSetSlot(index, items.length);
+    const targetScreen = slot
+      ? wallScreens.find((screen) => screen.wallSlot === slot && !usedScreenIds.has(screen.id)) || null
+      : wallScreens.find((screen) => !usedScreenIds.has(screen.id)) || null;
+    if (targetScreen) {
+      usedScreenIds.add(targetScreen.id);
+    }
+    return {
+      item,
+      slot,
+      targetScreen
+    };
+  });
+  const issues = [];
+  if (!wallContext) {
+    issues.push("Choose a target wall for this set.");
+  }
+  mappings.forEach((mapping) => {
+    if (mapping.targetScreen) {
+      return;
+    }
+    if (mapping.slot) {
+      issues.push(`${wallSlotLabel(mapping.slot)} slot is not available on the selected wall.`);
+      return;
+    }
+    issues.push(`Position ${mapping.item.position} does not have an available frame on the selected wall.`);
+  });
+  return {
+    wallContext,
+    mappings,
+    issues,
+    canSend: Boolean(wallContext) && mappings.length > 0 && issues.length === 0
+  };
 }
 
 function clearImagesFromCollections(imageNames) {
@@ -1729,6 +2149,53 @@ function formatImageDimensions(image) {
   return parts.join(" · ");
 }
 
+function isManualCropDraft(draft) {
+  if (!draft) {
+    return false;
+  }
+  return draft.zoom !== EDIT_RECIPE_DEFAULTS.zoom
+    || draft.panX !== EDIT_RECIPE_DEFAULTS.panX
+    || draft.panY !== EDIT_RECIPE_DEFAULTS.panY;
+}
+
+function getContentEditCropMode(editState) {
+  if (editState?.cropMode === "manual" || editState?.cropMode === "preset") {
+    return editState.cropMode;
+  }
+  return isManualCropDraft(editState?.draft) ? "manual" : "preset";
+}
+
+function createContentMetaChips(labels, extraClass = "") {
+  const normalized = labels
+    .map((label) => String(label || "").trim())
+    .filter(Boolean);
+  if (!normalized.length) {
+    return "";
+  }
+  return `
+    <div class="content-meta-row${extraClass ? ` ${extraClass}` : ""}">
+      ${normalized.map((label) => `<span class="content-meta-chip">${label}</span>`).join("")}
+    </div>
+  `;
+}
+
+function getContentAssetFactLabels(image, { sourcePrefix = false, includeSize = true } = {}) {
+  const labels = [];
+  if (image?.width && image?.height) {
+    labels.push(sourcePrefix ? `Source ${image.width}×${image.height}` : `${image.width}×${image.height}`);
+  }
+  if (image?.orientation) {
+    labels.push(image.orientation);
+  }
+  if (image?.format) {
+    labels.push(String(image.format).toUpperCase());
+  }
+  if (includeSize && Number.isFinite(image?.size)) {
+    labels.push(formatBytes(image.size));
+  }
+  return labels;
+}
+
 function createOutputImageCard(image) {
   const isManageMode = state.ui.contentManageMode;
   const isSelected = isManageMode
@@ -1750,6 +2217,9 @@ function createOutputImageCard(image) {
   const metaLine = dimensionsLine
     ? `${dimensionsLine} · ${formatBytes(image.size)}`
     : `${formatDateTime(image.modifiedAt)} · ${formatBytes(image.size)}`;
+  const previewImageUrl = image.editRecipe
+    ? buildSavedContentPreviewUrl(image)
+    : `${image.url}?t=${encodeURIComponent(image.modifiedAt)}`;
   const previewAction = isManageMode ? "select-content-image" : "open-content-preview";
   return `
     <article
@@ -1792,7 +2262,7 @@ function createOutputImageCard(image) {
         aria-label="${isManageMode ? `Select ${image.name}` : `Preview ${image.name}`}"
       >
         ${isManageMode ? `<span class="output-card-select ${isSelected ? "is-selected" : ""}"></span>` : ""}
-        <img src="${image.url}?t=${encodeURIComponent(image.modifiedAt)}" alt="${image.name}" />
+        <img src="${previewImageUrl}" alt="${image.name}" />
       </button>
       <button
         type="button"
@@ -1864,63 +2334,408 @@ function createContentBrowseCollectionsPanel() {
   `;
 }
 
-function createContentSetsPanel() {
+function createContentSetsPanel({ showEmpty = false } = {}) {
   const sets = getContentLibrary().sets || [];
-  if (!sets.length) return "";
-  const enabledScreens = state.project.screens.filter((screen) => screen.enabled);
+  if (!sets.length && !showEmpty) return "";
   return `
     <section class="content-library-panel content-library-panel--sets">
       <div class="content-library-copy">
-        <span class="device-summary-kicker">Ordered Sets</span>
-        <strong>${sets.length} set${sets.length === 1 ? "" : "s"} ready to send</strong>
-        <span>Each set maps position 1..N to the first ${enabledScreens.length} enabled frame${enabledScreens.length === 1 ? "" : "s"}. Send Set dispatches every position in parallel.</span>
+        <span class="device-summary-kicker">Wall Layouts</span>
+        <strong>${sets.length ? `${sets.length} ordered set${sets.length === 1 ? "" : "s"}` : "No wall layouts yet"}</strong>
+        <span>Use ordered sets for triptychs and other multi-frame layouts. Each set can target a wall and assign posters to left, center, and right slots before you send it.</span>
       </div>
-      <div class="content-set-grid">
-        ${sets.map((set) => createContentSetCard(set, enabledScreens)).join("")}
+      ${
+        sets.length
+          ? `<div class="content-set-grid">${sets.map((set) => createContentSetCard(set)).join("")}</div>`
+          : `<div class="empty-state empty-state--compact"><div><h2>No wall layouts yet</h2><p>Select posters below, then create an ordered set for a triptych or any other multi-frame wall arrangement.</p></div></div>`
+      }
+    </section>
+  `;
+}
+
+function createContentBrowseLayoutHintPanel() {
+  const setCount = getContentLibrary().sets.length;
+  if (!setCount) {
+    return "";
+  }
+  return `
+    <section class="content-scope-panel content-scope-panel--layouts">
+      <div class="content-library-copy">
+        <span class="device-summary-kicker">Wall Layouts</span>
+        <strong>${setCount} ordered set${setCount === 1 ? "" : "s"} in your library</strong>
+        <span>Triptychs and other grouped wall layouts are managed in Manage Library so normal browsing stays focused on single-poster preview and send.</span>
+      </div>
+      <div class="content-scope-actions">
+        <button type="button" class="secondary" data-action="open-content-manage">Manage Wall Layouts</button>
       </div>
     </section>
   `;
 }
 
-function createContentSetCard(set, enabledScreens) {
-  const positions = set.items || [];
-  const canSend = positions.length > 0 && enabledScreens.length >= positions.length;
-  const imagesByName = new Map(state.outputImages.map((image) => [image.name, image]));
-  const thumbs = positions.map((item) => {
-    const image = imagesByName.get(item.imageName);
-    const src = image ? `${image.url}?t=${encodeURIComponent(image.modifiedAt)}` : "";
-    const targetScreen = enabledScreens[item.position - 1] || null;
-    const mapLabel = targetScreen ? targetScreen.name : "No frame";
+function createContentSetCard(set) {
+  const positions = [...(set.items || [])].sort((a, b) => a.position - b.position);
+  const { wallContext, mappings, issues, canSend } = getContentSetMappings(set, { enabledOnly: true });
+  const imagesByName = new Map(getEnrichedOutputImages().map((image) => [image.name, image]));
+  const thumbs = mappings.map((mapping) => {
+    const image = imagesByName.get(mapping.item.imageName);
+    const src = image ? buildSavedContentPreviewUrl(image) : "";
+    const mapLabel = mapping.targetScreen ? mapping.targetScreen.name : "No frame";
+    const slotLabel = mapping.slot ? wallSlotLabel(mapping.slot) : `Position ${mapping.item.position}`;
     return `
       <div class="content-set-thumb">
         <div class="content-set-thumb-image">
-          ${src ? `<img src="${src}" alt="${item.imageName}" />` : `<span class="content-set-thumb-missing">Missing</span>`}
-          <span class="content-set-position-badge">${item.position}</span>
+          ${src ? `<img src="${src}" alt="${mapping.item.imageName}" />` : `<span class="content-set-thumb-missing">Missing</span>`}
+          <span class="content-set-position-badge">${slotLabel}</span>
         </div>
         <div class="content-set-thumb-meta">
-          <strong>${item.imageName}</strong>
-          <span>→ ${mapLabel}</span>
+          <strong>${mapping.item.imageName}</strong>
+          <span>${slotLabel} → ${mapLabel}</span>
         </div>
       </div>
     `;
   }).join("");
+  const wallLabel = wallContext ? `${wallContext.room.name} / ${wallContext.wall.name}` : "No wall assigned";
   const sendTitle = canSend
-    ? `Send ${set.name} to ${positions.length} frame${positions.length === 1 ? "" : "s"}`
-    : `Enable at least ${positions.length} frame${positions.length === 1 ? "" : "s"} to send this set`;
+    ? `Send ${set.name} to ${wallLabel}`
+    : issues[0] || "Finish the wall mapping before sending this set.";
   return `
     <article class="content-set-card" data-set-id="${set.id}">
       <header class="content-set-card-header">
         <div class="content-set-card-copy">
           <strong>${set.name}</strong>
-          <span>${positions.length} position${positions.length === 1 ? "" : "s"}</span>
+          <span>${positions.length} panel${positions.length === 1 ? "" : "s"} · ${wallLabel}</span>
         </div>
-        <button type="button" class="icon-button icon-button--ghost icon-button--small" data-action="delete-content-set" data-set-id="${set.id}" aria-label="Delete set">×</button>
+        <div class="content-set-card-tools">
+          <button
+            type="button"
+            class="icon-button icon-button--ghost icon-button--small"
+            data-action="open-content-set-editor"
+            data-set-id="${set.id}"
+            aria-label="Edit set layout"
+            title="Edit layout"
+          >
+            ${iconSvg("controls")}
+          </button>
+          <button type="button" class="icon-button icon-button--ghost icon-button--small" data-action="delete-content-set" data-set-id="${set.id}" aria-label="Delete set">×</button>
+        </div>
       </header>
+      ${issues.length ? `<p class="content-set-card-warning">${issues[0]}</p>` : ""}
       <div class="content-set-card-thumbs">${thumbs}</div>
       <footer class="content-set-card-footer">
-        <button type="button" data-action="send-content-set" data-set-id="${set.id}" ${canSend ? "" : "disabled"} title="${sendTitle}">Send Set</button>
+        <button type="button" class="secondary" data-action="open-content-set-editor" data-set-id="${set.id}">Edit Layout</button>
+        <button type="button" class="secondary" data-action="open-content-set-schedule" data-set-id="${set.id}" ${canSend ? "" : "disabled"} title="${sendTitle}">Schedule</button>
+        <button type="button" data-action="send-content-set" data-set-id="${set.id}" ${canSend ? "" : "disabled"} title="${sendTitle}">Send to Wall</button>
       </footer>
     </article>
+  `;
+}
+
+function createContentSetEditorModal() {
+  const setId = state.ui.contentSetEditorId || "";
+  const set = getContentSetById(setId);
+  if (!set) {
+    return "";
+  }
+  const { wallContext, mappings, issues, canSend } = getContentSetMappings(set, { enabledOnly: true });
+  const wallOptions = getAllWallContexts();
+  const imagesByName = new Map(getEnrichedOutputImages().map((image) => [image.name, image]));
+  const enabledWallCount = wallContext ? getWallScreensBySlot(wallContext.wall.id, { enabledOnly: true }).length : 0;
+  const wallWarnings = wallContext ? getWallSlotWarnings(getWallSlotOccupancy(wallContext.wall)) : [];
+  return `
+    <div class="modal-backdrop" data-action="close-content-set-editor"></div>
+    <section class="modal-shell modal-shell--set-editor" role="dialog" aria-modal="true" aria-label="Edit ordered set">
+      <div class="modal-header">
+        <div>
+          <p class="modal-kicker">Ordered Set</p>
+          <h2>${set.name}</h2>
+          <p class="send-flow-copy">Assign this layout to a wall, then map each poster to a slot before sending it.</p>
+        </div>
+        <button type="button" class="icon-button icon-button--ghost" data-action="close-content-set-editor" aria-label="Close set editor">
+          ${iconSvg("close")}
+        </button>
+      </div>
+      <div class="modal-body modal-body--set-editor">
+        <aside class="content-set-editor-sidebar">
+          <label class="content-set-editor-field">
+            <span>Set name</span>
+            <input id="content-set-editor-name" data-set-id="${set.id}" type="text" value="${set.name.replace(/"/g, "&quot;")}" />
+          </label>
+          <label class="content-set-editor-field">
+            <span>Target wall</span>
+            <select id="content-set-editor-wall" data-set-id="${set.id}">
+              <option value="">Choose wall</option>
+              ${wallOptions.map(({ room, wall }) => {
+                const enabledCount = getWallScreensBySlot(wall.id, { enabledOnly: true }).length;
+                return `<option value="${wall.id}" ${set.wallId === wall.id ? "selected" : ""}>${room.name} / ${wall.name} · ${enabledCount} enabled</option>`;
+              }).join("")}
+            </select>
+          </label>
+          ${wallContext
+            ? createContentMetaChips([
+                `${wallContext.room.name} / ${wallContext.wall.name}`,
+                `${enabledWallCount} enabled frame${enabledWallCount === 1 ? "" : "s"}`
+              ], "content-meta-row--preview")
+            : ""}
+          ${issues.length
+            ? `
+              <div class="content-set-editor-note content-set-editor-note--warn">
+                <strong>Needs attention</strong>
+                <span>${issues[0]}</span>
+              </div>
+            `
+            : `
+              <div class="content-set-editor-note">
+                <strong>Ready to send</strong>
+                <span>${wallContext ? `${set.name} is mapped to ${wallContext.room.name} / ${wallContext.wall.name}.` : "Choose a wall to finish the mapping."}</span>
+              </div>
+            `}
+          ${wallWarnings.length
+            ? `
+              <div class="content-set-editor-note">
+                <strong>Wall notes</strong>
+                <span>${wallWarnings[0]}</span>
+              </div>
+            `
+            : ""}
+        </aside>
+        <div class="content-set-editor-items">
+          ${mappings.map((mapping, index) => {
+            const image = imagesByName.get(mapping.item.imageName);
+            const previewMarkup = image
+              ? `<img src="${buildSavedContentPreviewUrl(image)}" alt="${mapping.item.imageName}" />`
+              : `<span>Missing</span>`;
+            return `
+              <article class="content-set-editor-item">
+                <div class="content-set-editor-item-preview">${previewMarkup}</div>
+                <div class="content-set-editor-item-copy">
+                  <span class="device-summary-kicker">Panel ${index + 1}</span>
+                  <strong>${mapping.item.imageName}</strong>
+                  <span>${mapping.targetScreen ? `Mapped to ${mapping.targetScreen.name}` : "No matching frame yet"}</span>
+                </div>
+                <label class="content-set-editor-field">
+                  <span>Slot</span>
+                  <select data-set-slot-input="true" data-set-id="${set.id}" data-image-name="${mapping.item.imageName}">
+                    <option value="">Auto</option>
+                    ${["left", "center", "right"].map((slot) => `<option value="${slot}" ${mapping.item.slot === slot ? "selected" : ""}>${wallSlotLabel(slot)}</option>`).join("")}
+                  </select>
+                </label>
+              </article>
+            `;
+          }).join("")}
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="secondary" data-action="close-content-set-editor">Close</button>
+        <button type="button" class="secondary" data-action="open-content-set-schedule" data-set-id="${set.id}" ${canSend ? "" : "disabled"}>Schedule</button>
+        <button type="button" data-action="send-content-set" data-set-id="${set.id}" ${canSend ? "" : "disabled"}>Send to Wall</button>
+      </div>
+    </section>
+  `;
+}
+
+function getContentScheduleWarning(schedule) {
+  if (schedule.kind === "set") {
+    const set = getContentSetById(schedule.setId);
+    if (!set) {
+      return "This schedule points to a wall layout that no longer exists.";
+    }
+    const mapping = getContentSetMappings(set, { enabledOnly: true });
+    return mapping.issues[0] || "";
+  }
+
+  const image = state.outputImages.find((entry) => entry.name === schedule.imageName);
+  if (!image) {
+    return "This schedule points to a poster that no longer exists.";
+  }
+  const missingTargets = (schedule.screenIds || []).filter((screenId) => !state.project.screens.some((screen) => screen.id === screenId && screen.enabled));
+  if (missingTargets.length) {
+    return "One or more scheduled frames are missing or disabled.";
+  }
+  return "";
+}
+
+function createContentScheduleCard(schedule) {
+  const target = getContentScheduleTargetSummary(schedule);
+  const warning = getContentScheduleWarning(schedule);
+  const recurrence = getContentScheduleRecurrenceLabel(schedule);
+  const nextLabel = getContentScheduleNextLabel(schedule);
+  const statusLabel = getContentScheduleStatusLabel(schedule);
+  const kindLabel = schedule.kind === "set" ? "Wall layout" : "Poster";
+  return `
+    <article class="content-schedule-card" data-schedule-id="${schedule.id}">
+      <header class="content-schedule-card-header">
+        <div class="content-schedule-card-copy">
+          <span class="device-summary-kicker">${kindLabel}</span>
+          <strong>${schedule.name}</strong>
+          <span>${target.title}</span>
+          <span>${target.detail}</span>
+        </div>
+        <div class="content-set-card-tools">
+          <button
+            type="button"
+            class="icon-button icon-button--ghost icon-button--small"
+            data-action="open-content-schedule-editor"
+            data-schedule-id="${schedule.id}"
+            aria-label="Edit schedule"
+            title="Edit schedule"
+          >
+            ${iconSvg("edit")}
+          </button>
+          <button
+            type="button"
+            class="icon-button icon-button--ghost icon-button--small"
+            data-action="delete-content-schedule"
+            data-schedule-id="${schedule.id}"
+            aria-label="Delete schedule"
+            title="Delete schedule"
+          >
+            ${iconSvg("close")}
+          </button>
+        </div>
+      </header>
+      ${warning ? `<p class="content-set-card-warning">${warning}</p>` : ""}
+      ${createContentMetaChips([recurrence, nextLabel, statusLabel], "content-meta-row--preview")}
+      ${schedule.lastError ? `<p class="content-schedule-card-detail">${schedule.lastError}</p>` : ""}
+      <footer class="content-set-card-footer">
+        <button type="button" class="secondary" data-action="open-content-schedule-editor" data-schedule-id="${schedule.id}">Edit</button>
+        <button type="button" class="secondary" data-action="toggle-content-schedule-enabled" data-schedule-id="${schedule.id}">
+          ${schedule.enabled ? "Pause" : "Resume"}
+        </button>
+      </footer>
+    </article>
+  `;
+}
+
+function createContentSchedulesPanel({ showEmpty = false } = {}) {
+  const schedules = [...state.contentSchedules].sort((a, b) => String(b.updatedAt || "").localeCompare(String(a.updatedAt || "")));
+  if (!schedules.length && !showEmpty) {
+    return "";
+  }
+
+  return `
+    <section class="content-library-panel content-library-panel--automation">
+      <div class="content-library-row">
+        <div class="content-library-copy">
+          <span class="device-summary-kicker">Automation</span>
+          <strong>${schedules.length ? `${schedules.length} scheduled send${schedules.length === 1 ? "" : "s"}` : "No schedules yet"}</strong>
+          <span>Use schedules for timed poster sends to one or more frames, or timed wall-layout pushes for ordered multi-frame sets.</span>
+        </div>
+        <div class="content-scope-actions">
+          <button type="button" class="secondary" data-action="refresh-content-schedules">
+            ${iconSvg("refresh")}
+            <span>Refresh</span>
+          </button>
+        </div>
+      </div>
+      ${
+        schedules.length
+          ? `<div class="content-set-grid content-schedule-grid">${schedules.map((schedule) => createContentScheduleCard(schedule)).join("")}</div>`
+          : showEmpty
+            ? `<div class="empty-state empty-state--compact"><div><h2>No schedules yet</h2><p>Choose a poster in browse mode or open a wall layout here, then save a time-based send.</p></div></div>`
+            : ""
+      }
+    </section>
+  `;
+}
+
+function createContentBrowseAutomationHintPanel() {
+  const scheduleCount = state.contentSchedules.length;
+  if (!scheduleCount) {
+    return "";
+  }
+
+  return `
+    <section class="content-scope-panel content-scope-panel--layouts">
+      <div class="content-library-copy">
+        <span class="device-summary-kicker">Automation</span>
+        <strong>${scheduleCount} scheduled send${scheduleCount === 1 ? "" : "s"} saved</strong>
+        <span>Schedules live in Manage Library so browse mode stays focused on quick preview, target selection, and send.</span>
+      </div>
+      <div class="content-scope-actions">
+        <button type="button" class="secondary" data-action="open-content-automation">Manage Schedules</button>
+      </div>
+    </section>
+  `;
+}
+
+function createContentScheduleModal() {
+  const draft = state.ui.contentScheduleDraft;
+  if (!draft) {
+    return "";
+  }
+
+  const isEditing = Boolean(draft.id);
+  const target = draft.kind === "set" ? getContentSetById(draft.setId) : null;
+  const targetMapping = target ? getContentSetMappings(target, { enabledOnly: true }) : null;
+  const targetSummary = draft.kind === "set"
+    ? {
+        title: target?.name || "Missing wall layout",
+        detail: target
+          ? (targetMapping?.wallContext
+              ? `${targetMapping.wallContext.room.name} / ${targetMapping.wallContext.wall.name}`
+              : "Choose a wall before scheduling")
+          : "This set no longer exists."
+      }
+    : getContentScheduleTargetSummary({
+        kind: "image",
+        imageName: draft.imageName,
+        screenIds: draft.screenIds
+      });
+  const recurrenceCopy = draft.recurrence === "weekly"
+    ? "Runs every week on the weekday you choose below."
+    : draft.recurrence === "daily"
+      ? "Runs every day at the chosen time."
+      : "Runs once at the exact date and time below.";
+
+  return `
+    <div class="modal-backdrop" data-action="close-content-schedule"></div>
+    <section class="modal-shell modal-shell--compact" role="dialog" aria-modal="true" aria-label="${isEditing ? "Edit schedule" : "Create schedule"}">
+      <div class="modal-header">
+        <div>
+          <p class="modal-kicker">Automation</p>
+          <h2>${isEditing ? "Edit Schedule" : "Schedule Send"}</h2>
+          <p class="send-flow-copy">${draft.kind === "set" ? "Schedule an ordered wall layout." : "Schedule a poster send to the selected frames."}</p>
+        </div>
+        <button type="button" class="icon-button icon-button--ghost" data-action="close-content-schedule" aria-label="Close schedule editor">
+          ${iconSvg("close")}
+        </button>
+      </div>
+      <div class="modal-body modal-body--schedule">
+        <div class="content-schedule-form">
+          <label class="content-schedule-field">
+            <span>Schedule name</span>
+            <input id="content-schedule-name" type="text" value="${draft.name.replace(/"/g, "&quot;")}" />
+          </label>
+          <div class="content-schedule-note">
+            <strong>${targetSummary.title}</strong>
+            <span>${targetSummary.detail}</span>
+          </div>
+          <div class="content-schedule-field-row">
+            <label class="content-schedule-field">
+              <span>Frequency</span>
+              <select id="content-schedule-recurrence">
+                <option value="once" ${draft.recurrence === "once" ? "selected" : ""}>Once</option>
+                <option value="daily" ${draft.recurrence === "daily" ? "selected" : ""}>Daily</option>
+                <option value="weekly" ${draft.recurrence === "weekly" ? "selected" : ""}>Weekly</option>
+              </select>
+            </label>
+            <label class="content-schedule-field">
+              <span>${draft.recurrence === "once" ? "Run at" : draft.recurrence === "weekly" ? "Starts on" : "Starts"}</span>
+              <input id="content-schedule-datetime" type="datetime-local" value="${draft.datetimeLocal}" />
+            </label>
+          </div>
+          <p class="modal-inline-note">${recurrenceCopy} Times follow ${draft.timeZone}.</p>
+          <label class="toggle toggle--inline">
+            <input id="content-schedule-enabled" type="checkbox" ${draft.enabled ? "checked" : ""} />
+            <span>Schedule enabled</span>
+          </label>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="secondary" data-action="close-content-schedule">Cancel</button>
+        <button type="button" data-action="save-content-schedule">${isEditing ? "Save" : "Create Schedule"}</button>
+      </div>
+    </section>
   `;
 }
 
@@ -1990,8 +2805,8 @@ function createContentManagePanel() {
       <div class="content-library-row">
         <div class="content-library-copy">
           <span class="device-summary-kicker">Manage Library</span>
-          <strong>Organize posters into collections</strong>
-          <span>Select posters below, create a collection if needed, then assign the selection. Collections are for browseable themes. Ordered sets stay reserved for multi-frame layouts.</span>
+          <strong>Organize collections and wall layouts</strong>
+          <span>Select posters below, then assign them to a collection, turn them into an ordered wall layout, or manage scheduled sends for posters and wall layouts.</span>
         </div>
         <div class="content-library-create-stack">
           <div class="spotify-search-row manage-search-row content-library-create-row">
@@ -2006,8 +2821,9 @@ function createContentManagePanel() {
       </div>
       <div class="content-manage-steps">
         <span class="content-step-chip">1. Select posters</span>
-        <span class="content-step-chip">2. Create or choose a collection</span>
-        <span class="content-step-chip">3. Exit Manage Library to browse and send</span>
+        <span class="content-step-chip">2. Assign collection or create wall layout</span>
+        <span class="content-step-chip">3. Save schedules for posters or wall layouts</span>
+        <span class="content-step-chip">4. Browse for quick sends anytime</span>
       </div>
       <div class="content-filter-row">
         <button
@@ -2044,7 +2860,7 @@ function createContentManagePanel() {
         <div class="content-assign-copy">
           <span class="device-summary-kicker">Selected Posters</span>
           <strong>${selectedCount ? `${selectedCount} selected` : "Nothing selected yet"}</strong>
-          <span>${selectedCount ? "Assign the current selection to a collection or clear its collection membership." : "Tap posters below to build a multi-select."}</span>
+          <span>${selectedCount ? "Assign the current selection to a collection, or create an ordered set for a wall layout." : "Tap posters below to build a multi-select."}</span>
         </div>
         <div class="content-assign-actions">
           ${summary.collections.map((collection) => `
@@ -2061,6 +2877,8 @@ function createContentManagePanel() {
           <button type="button" class="secondary" data-action="clear-content-collections" ${selectedCount ? "" : "disabled"}>Clear Collections</button>
         </div>
       </div>
+      ${createContentSetsPanel({ showEmpty: true })}
+      ${createContentSchedulesPanel({ showEmpty: true })}
     </section>
   `;
 }
@@ -2116,6 +2934,7 @@ function createContentActionBar() {
         <button type="button" class="secondary" data-action="cancel-content">Cancel</button>
         <button type="button" class="secondary" ${selectedImage ? "" : "disabled"} data-action="delete-content">Delete</button>
         <button type="button" class="secondary" ${selectedImage ? "" : "disabled"} data-action="replace-content">Replace</button>
+        <button type="button" class="secondary" ${selectedImage && targetScreens.length ? "" : "disabled"} data-action="open-selected-content-schedule">Schedule</button>
         <button type="button" ${selectedImage && targetScreens.length ? "" : "disabled"} data-action="send-content">Send</button>
       </div>
     </div>
@@ -3261,8 +4080,14 @@ function createContentPreviewModal() {
   if (!image) {
     return "";
   }
+  const targetScreens = getContentTargetScreens();
   const dimensionsLine = formatImageDimensions(image);
   const hasEdits = Boolean(image.editRecipe);
+  const previewUrl = buildSavedContentPreviewUrl(image);
+  const targetScreen = getCanonicalContentTargetScreen();
+  const previewFacts = [
+    targetScreen?.size ? `Frame ${targetScreen.size.width}×${targetScreen.size.height}` : ""
+  ];
   const fitCheck = evaluateImageFit(image, getFitCheckTargetScreens());
   const fitWarning = fitCheck.status.startsWith("warn")
     ? `<p class="content-preview-warning" title="${fitCheck.title}"><strong>${fitCheck.label}.</strong> ${fitCheck.title}</p>`
@@ -3273,9 +4098,10 @@ function createContentPreviewModal() {
     <section class="modal-shell modal-shell--preview" role="dialog" aria-modal="true" aria-label="Content preview">
       <div class="modal-header">
         <div>
-          <p class="modal-kicker">Content Preview${hasEdits ? ` · <span class="content-meta-chip content-meta-chip--edited">Edited</span>` : ""}</p>
+          <p class="modal-kicker">Frame Preview${hasEdits ? ` · <span class="content-meta-chip content-meta-chip--edited">Edited</span>` : ""}</p>
           <h2>${image.name}</h2>
           <p class="send-flow-copy">${dimensionsLine ? `${dimensionsLine} · ` : ""}${formatBytes(image.size)} · ${formatDateTime(image.modifiedAt)}</p>
+          ${createContentMetaChips(previewFacts, "content-meta-row--preview")}
           ${fitWarning}
         </div>
         <button type="button" class="icon-button icon-button--ghost" data-action="close-content-preview" aria-label="Close preview">
@@ -3284,26 +4110,17 @@ function createContentPreviewModal() {
       </div>
       <div class="modal-body modal-body--preview">
         <div class="content-preview-frame">
-          <img src="${image.url}?t=${encodeURIComponent(image.modifiedAt)}" alt="${image.name}" />
+          <img src="${previewUrl}" alt="${image.name}" />
         </div>
       </div>
       <div class="modal-footer modal-footer--preview">
         ${hasEdits ? `<button type="button" class="secondary" data-action="reset-content-edit" data-image-name="${image.name}">Reset edits</button>` : ""}
         <button type="button" data-action="open-content-edit" data-image-name="${image.name}">Edit image</button>
+        <button type="button" class="secondary" data-action="open-content-image-schedule" data-image-name="${image.name}" ${targetScreens.length ? "" : "disabled"}>Schedule</button>
         <button type="button" class="secondary" data-action="close-content-preview">Close</button>
       </div>
     </section>
   `;
-}
-
-function buildEditPreviewFilter(draft) {
-  const filters = [];
-  if (draft.brightness !== 1) filters.push(`brightness(${draft.brightness})`);
-  if (draft.contrast !== 1) filters.push(`contrast(${draft.contrast})`);
-  if (draft.grayscale) filters.push("grayscale(1)");
-  if (draft.invert) filters.push("invert(1)");
-  if (draft.blur > 0) filters.push(`blur(${(draft.blur * 0.8).toFixed(1)}px)`);
-  return filters.length ? filters.join(" ") : "none";
 }
 
 function createContentEditModal() {
@@ -3316,18 +4133,28 @@ function createContentEditModal() {
     return "";
   }
   const draft = editState.draft;
-  const filterString = buildEditPreviewFilter(draft);
-  const transformString = `rotate(${draft.rotate}deg)`;
+  const cropMode = getContentEditCropMode(editState);
   const dimensionsLine = formatImageDimensions(image);
-  const screens = state.project.screens.filter((screen) => screen.enabled);
-  const targetScreen = draft.targetScreenId
-    ? screens.find((screen) => screen.id === draft.targetScreenId)
-    : null;
+  const targetScreen = getCanonicalContentTargetScreen();
   const targetDims = targetScreen?.size
-    ? `Will render to ${targetScreen.size.width}×${targetScreen.size.height}`
-    : "No target screen — renders at source dimensions";
+    ? `Canonical Samsung frame: ${targetScreen.size.width}×${targetScreen.size.height}`
+    : "Canonical frame size unavailable";
+  const previewFacts = getContentAssetFactLabels(image, { sourcePrefix: true });
   const anchors = ["center", "top", "bottom", "left", "right"];
   const saving = Boolean(editState.saving);
+  const previewUrl = buildContentEditPreviewUrl(image.name, draft, image.modifiedAt);
+  const discardPrompt = editState.confirmDiscard
+    ? `
+      <div class="content-edit-discard">
+        <strong>Discard unsaved edits?</strong>
+        <span>Your current adjustments have not been saved yet.</span>
+        <div class="content-edit-discard-actions">
+          <button type="button" class="secondary" data-action="dismiss-content-edit-discard">Keep editing</button>
+          <button type="button" data-action="confirm-content-edit-discard">Discard</button>
+        </div>
+      </div>
+    `
+    : "";
 
   return `
     <div class="modal-backdrop" data-action="cancel-content-edit"></div>
@@ -3344,30 +4171,82 @@ function createContentEditModal() {
       </div>
       <div class="modal-body modal-body--edit">
         <div class="content-edit-preview">
-          <img
-            id="content-edit-preview-img"
-            src="${image.url}?t=${encodeURIComponent(image.modifiedAt)}"
-            alt="${image.name}"
-            style="filter: ${filterString}; transform: ${transformString};"
-          />
+          <div class="content-edit-preview-stage">
+            <img
+              id="content-edit-preview-img"
+              src="${previewUrl}"
+              alt="${image.name}"
+            />
+          </div>
           <p class="send-flow-copy content-edit-target-note">${targetDims}</p>
+          ${createContentMetaChips(previewFacts, "content-meta-row--center")}
+          ${discardPrompt}
         </div>
         <form id="content-edit-form" class="content-edit-form" onsubmit="return false;">
           <fieldset class="content-edit-group">
-            <legend>Frame fit</legend>
-            <label>
-              <span>Fit mode</span>
-              <select name="fit">
-                <option value="contain" ${draft.fit === "contain" ? "selected" : ""}>Contain</option>
-                <option value="cover" ${draft.fit === "cover" ? "selected" : ""}>Cover</option>
-              </select>
-            </label>
-            <label>
-              <span>Crop anchor</span>
-              <select name="cropAnchor">
-                ${anchors.map((a) => `<option value="${a}" ${draft.cropAnchor === a ? "selected" : ""}>${a}</option>`).join("")}
-              </select>
-            </label>
+            <legend>Frame Crop</legend>
+            <div class="content-edit-mode-switch" role="tablist" aria-label="Crop mode">
+              <button
+                type="button"
+                class="content-edit-mode-pill ${cropMode === "preset" ? "is-selected" : ""}"
+                data-action="set-content-edit-crop-mode"
+                data-mode="preset"
+                aria-pressed="${cropMode === "preset" ? "true" : "false"}"
+              >
+                Quick fit
+              </button>
+              <button
+                type="button"
+                class="content-edit-mode-pill ${cropMode === "manual" ? "is-selected" : ""}"
+                data-action="set-content-edit-crop-mode"
+                data-mode="manual"
+                aria-pressed="${cropMode === "manual" ? "true" : "false"}"
+              >
+                Manual crop
+              </button>
+            </div>
+            ${cropMode === "manual"
+              ? `
+                <p class="content-edit-group-copy">Zoom and move the source image inside the frame. Fit mode sets the starting crop.</p>
+                <label>
+                  <span>Fit mode</span>
+                  <select name="fit">
+                    <option value="contain" ${draft.fit === "contain" ? "selected" : ""}>Contain</option>
+                    <option value="cover" ${draft.fit === "cover" ? "selected" : ""}>Cover</option>
+                  </select>
+                </label>
+                <div class="content-edit-inline-actions">
+                  <button type="button" class="content-edit-inline-button secondary" data-action="reset-content-edit-framing">Reset framing</button>
+                </div>
+                <label class="content-edit-slider">
+                  <span>Zoom <em data-value-for="zoom">${draft.zoom.toFixed(2)}</em></span>
+                  <input type="range" name="zoom" min="1" max="3" step="0.05" value="${draft.zoom}" />
+                </label>
+                <label class="content-edit-slider">
+                  <span>Horizontal <em data-value-for="panX">${draft.panX.toFixed(2)}</em></span>
+                  <input type="range" name="panX" min="-1" max="1" step="0.05" value="${draft.panX}" />
+                </label>
+                <label class="content-edit-slider">
+                  <span>Vertical <em data-value-for="panY">${draft.panY.toFixed(2)}</em></span>
+                  <input type="range" name="panY" min="-1" max="1" step="0.05" value="${draft.panY}" />
+                </label>
+              `
+              : `
+                <p class="content-edit-group-copy">Pick a fit and anchor for fast framing without manually moving the image.</p>
+                <label>
+                  <span>Fit mode</span>
+                  <select name="fit">
+                    <option value="contain" ${draft.fit === "contain" ? "selected" : ""}>Contain</option>
+                    <option value="cover" ${draft.fit === "cover" ? "selected" : ""}>Cover</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Crop anchor</span>
+                  <select name="cropAnchor">
+                    ${anchors.map((a) => `<option value="${a}" ${draft.cropAnchor === a ? "selected" : ""}>${a}</option>`).join("")}
+                  </select>
+                </label>
+              `}
             <div class="content-edit-rotate">
               <span>Rotate</span>
               <div class="content-edit-rotate-buttons">
@@ -3390,10 +4269,6 @@ function createContentEditModal() {
               <input type="checkbox" name="grayscale" ${draft.grayscale ? "checked" : ""} />
               <span>Grayscale</span>
             </label>
-            <label class="content-edit-toggle">
-              <input type="checkbox" name="invert" ${draft.invert ? "checked" : ""} />
-              <span>Invert</span>
-            </label>
             <label class="content-edit-slider">
               <span>Brightness <em data-value-for="brightness">${draft.brightness.toFixed(2)}</em></span>
               <input type="range" name="brightness" min="0.5" max="1.5" step="0.05" value="${draft.brightness}" />
@@ -3405,6 +4280,10 @@ function createContentEditModal() {
             <label class="content-edit-slider">
               <span>Gamma <em data-value-for="gamma">${draft.gamma.toFixed(2)}</em></span>
               <input type="range" name="gamma" min="1" max="3" step="0.1" value="${draft.gamma}" />
+            </label>
+            <label class="content-edit-slider">
+              <span>Vibrance <em data-value-for="vibrance">${draft.vibrance.toFixed(2)}</em></span>
+              <input type="range" name="vibrance" min="0.5" max="1.8" step="0.05" value="${draft.vibrance}" />
             </label>
             <label class="content-edit-slider">
               <span>Black point <em data-value-for="blackPoint">${draft.blackPoint.toFixed(2)}</em></span>
@@ -3425,21 +4304,6 @@ function createContentEditModal() {
             <label class="content-edit-slider">
               <span>Blur <em data-value-for="blur">${draft.blur.toFixed(1)}</em></span>
               <input type="range" name="blur" min="0" max="5" step="0.1" value="${draft.blur}" />
-            </label>
-          </fieldset>
-
-          <fieldset class="content-edit-group">
-            <legend>Target</legend>
-            <label>
-              <span>Render for screen</span>
-              <select name="targetScreenId">
-                <option value="">None</option>
-                ${screens.map((screen) => `
-                  <option value="${screen.id}" ${draft.targetScreenId === screen.id ? "selected" : ""}>
-                    ${screen.name} (${screen.size.width}×${screen.size.height})
-                  </option>
-                `).join("")}
-              </select>
             </label>
           </fieldset>
         </form>
@@ -3494,7 +4358,8 @@ function createSectionPanel() {
                 </div>
               </div>
               ${createContentBrowseCollectionsPanel()}
-              ${createContentSetsPanel()}
+              ${createContentBrowseLayoutHintPanel()}
+              ${createContentBrowseAutomationHintPanel()}
               ${createContentCollectionScopePanel()}
               ${createContentBrowseToolbar()}
             `
@@ -3566,6 +4431,12 @@ function createActiveModal() {
   }
   if (state.ui.modal === "content-edit") {
     return createContentEditModal();
+  }
+  if (state.ui.modal === "content-set-editor") {
+    return createContentSetEditorModal();
+  }
+  if (state.ui.modal === "content-schedule") {
+    return createContentScheduleModal();
   }
   if (state.ui.modal === "delete-imported-albums") {
     return createDeleteImportedAlbumsModal();
@@ -3754,6 +4625,8 @@ function bindWorkspaceEvents() {
 
   bindContentDropZone();
   bindContentEditForm();
+  bindContentSetEditorForm();
+  bindContentScheduleForm();
 
   app.querySelectorAll("[data-path]").forEach((element) => {
     element.addEventListener("change", handleFieldChange);
@@ -4273,6 +5146,8 @@ async function handleAction(button) {
     persistProject();
     if (input) input.value = "";
     state.ui.contentManageSelections = [];
+    state.ui.contentSetEditorId = set.id;
+    state.ui.modal = "content-set-editor";
     state.actions.notice = `Created set ${set.name} with ${set.items.length} position${set.items.length === 1 ? "" : "s"}.`;
     state.actions.error = "";
     renderWorkspace();
@@ -4294,6 +5169,194 @@ async function handleAction(button) {
     return;
   }
 
+  if (action === "open-content-set-editor") {
+    const setId = button.dataset.setId || "";
+    if (!getContentSetById(setId)) {
+      return;
+    }
+    state.ui.contentSetEditorId = setId;
+    state.ui.modal = "content-set-editor";
+    renderWorkspace();
+    return;
+  }
+
+  if (action === "close-content-set-editor") {
+    state.ui.contentSetEditorId = "";
+    state.ui.modal = null;
+    renderWorkspace();
+    return;
+  }
+
+  if (action === "open-selected-content-schedule") {
+    const selectedImage = state.outputImages.find((image) => image.name === state.ui.contentSelectedImage);
+    const targetIds = getContentTargetIds();
+    if (!selectedImage || !targetIds.length) {
+      state.actions.error = "Select a poster and at least one target frame before scheduling.";
+      renderWorkspace();
+      return;
+    }
+    state.ui.contentScheduleDraft = createImageScheduleDraft(selectedImage.name, targetIds);
+    state.ui.modal = "content-schedule";
+    renderWorkspace();
+    return;
+  }
+
+  if (action === "open-content-image-schedule") {
+    const imageName = button.dataset.imageName || state.ui.previewImageName || state.ui.contentSelectedImage || "";
+    const targetIds = getContentTargetIds();
+    if (!imageName || !targetIds.length) {
+      state.actions.error = "Select target frames before scheduling this poster.";
+      renderWorkspace();
+      return;
+    }
+    state.ui.contentScheduleDraft = createImageScheduleDraft(imageName, targetIds);
+    state.ui.modal = "content-schedule";
+    renderWorkspace();
+    return;
+  }
+
+  if (action === "open-content-set-schedule") {
+    const setId = button.dataset.setId || "";
+    const set = getContentSetById(setId);
+    if (!set) {
+      state.actions.error = "Set not found.";
+      renderWorkspace();
+      return;
+    }
+    const mapping = getContentSetMappings(set, { enabledOnly: true });
+    if (!mapping.canSend) {
+      state.actions.error = mapping.issues[0] || "Finish the wall mapping before scheduling this layout.";
+      renderWorkspace();
+      return;
+    }
+    state.ui.contentScheduleDraft = createSetScheduleDraft(set);
+    state.ui.modal = "content-schedule";
+    renderWorkspace();
+    return;
+  }
+
+  if (action === "open-content-schedule-editor") {
+    const scheduleId = button.dataset.scheduleId || "";
+    const schedule = getContentScheduleById(scheduleId);
+    if (!schedule) {
+      state.actions.error = "Schedule not found.";
+      renderWorkspace();
+      return;
+    }
+    state.ui.contentScheduleDraft = schedule.kind === "set"
+      ? buildContentScheduleDraft({
+          id: schedule.id,
+          name: schedule.name,
+          kind: "set",
+          setId: schedule.setId,
+          recurrence: schedule.recurrence,
+          datetimeLocal: scheduleToDateTimeLocal(schedule),
+          enabled: schedule.enabled,
+          timeZone: schedule.timeZone || ""
+        })
+      : createImageScheduleDraft(schedule.imageName, schedule.screenIds || [], schedule);
+    state.ui.modal = "content-schedule";
+    renderWorkspace();
+    return;
+  }
+
+  if (action === "close-content-schedule") {
+    state.ui.contentScheduleDraft = null;
+    state.ui.modal = null;
+    renderWorkspace();
+    return;
+  }
+
+  if (action === "save-content-schedule") {
+    const draft = state.ui.contentScheduleDraft;
+    if (!draft) {
+      renderWorkspace();
+      return;
+    }
+    const nextDraft = {
+      ...draft,
+      name: document.getElementById("content-schedule-name")?.value?.trim() ?? draft.name,
+      recurrence: document.getElementById("content-schedule-recurrence")?.value || draft.recurrence,
+      datetimeLocal: document.getElementById("content-schedule-datetime")?.value || draft.datetimeLocal,
+      enabled: Boolean(document.getElementById("content-schedule-enabled")?.checked)
+    };
+
+    try {
+      const payload = parseScheduleDraft(nextDraft);
+      let savedSchedule;
+      if (nextDraft.id) {
+        savedSchedule = await apiPutJson(`/api/content/schedules/${encodeURIComponent(nextDraft.id)}`, payload);
+        state.actions.notice = `Updated schedule ${savedSchedule.name}.`;
+      } else {
+        savedSchedule = await apiPostJson("/api/content/schedules", payload);
+        state.actions.notice = `Saved schedule ${savedSchedule.name}.`;
+      }
+      state.actions.error = "";
+      state.ui.contentScheduleDraft = null;
+      state.ui.modal = null;
+      await refreshContentSchedules({ render: false });
+    } catch (error) {
+      state.actions.error = error.message;
+    }
+    renderWorkspace();
+    return;
+  }
+
+  if (action === "toggle-content-schedule-enabled") {
+    const scheduleId = button.dataset.scheduleId || "";
+    const schedule = getContentScheduleById(scheduleId);
+    if (!schedule) {
+      state.actions.error = "Schedule not found.";
+      renderWorkspace();
+      return;
+    }
+    try {
+      await apiPutJson(`/api/content/schedules/${encodeURIComponent(schedule.id)}`, {
+        ...schedule,
+        enabled: !schedule.enabled
+      });
+      await refreshContentSchedules({ render: false });
+      state.actions.notice = `${schedule.enabled ? "Paused" : "Resumed"} ${schedule.name}.`;
+      state.actions.error = "";
+    } catch (error) {
+      state.actions.error = error.message;
+    }
+    renderWorkspace();
+    return;
+  }
+
+  if (action === "delete-content-schedule") {
+    const scheduleId = button.dataset.scheduleId || "";
+    const schedule = getContentScheduleById(scheduleId);
+    if (!schedule) {
+      state.actions.error = "Schedule not found.";
+      renderWorkspace();
+      return;
+    }
+    try {
+      await apiDeleteJson(`/api/content/schedules/${encodeURIComponent(schedule.id)}`);
+      await refreshContentSchedules({ render: false });
+      state.actions.notice = `Deleted schedule ${schedule.name}.`;
+      state.actions.error = "";
+    } catch (error) {
+      state.actions.error = error.message;
+    }
+    renderWorkspace();
+    return;
+  }
+
+  if (action === "refresh-content-schedules") {
+    try {
+      await refreshContentSchedules({ render: false });
+      state.actions.notice = "Schedules refreshed.";
+      state.actions.error = "";
+    } catch (error) {
+      state.actions.error = error.message;
+    }
+    renderWorkspace();
+    return;
+  }
+
   if (action === "send-content-set") {
     const setId = button.dataset.setId || "";
     const set = getContentSetById(setId);
@@ -4302,15 +5365,14 @@ async function handleAction(button) {
       renderWorkspace();
       return;
     }
-    const enabledScreens = state.project.screens.filter((screen) => screen.enabled);
-    const positions = set.items || [];
-    if (enabledScreens.length < positions.length) {
-      state.actions.error = `Enable at least ${positions.length} frame${positions.length === 1 ? "" : "s"} before sending this set.`;
+    const mapping = getContentSetMappings(set, { enabledOnly: true });
+    if (!mapping.canSend) {
+      state.actions.error = mapping.issues[0] || "Finish the wall mapping before sending this set.";
       renderWorkspace();
       return;
     }
-    const mappedScreenIds = positions.map((_, index) => enabledScreens[index].id);
-    const targetNames = positions.map((_, index) => enabledScreens[index].name);
+    const mappedScreenIds = mapping.mappings.map((entry) => entry.targetScreen.id);
+    const targetNames = mapping.mappings.map((entry) => entry.targetScreen.name);
     state.ui.sendFlow = createPendingSendFlow({
       imageName: `Set: ${set.name}`,
       targetNames
@@ -4388,9 +5450,29 @@ async function handleAction(button) {
       if (!visibleNames.has(state.ui.contentSelectedImage)) {
         state.ui.contentSelectedImage = getVisibleOutputImages()[0]?.name || "";
       }
+    } else {
+      await refreshContentSchedules({ render: false });
     }
     state.actions.error = "";
     renderWorkspace();
+    return;
+  }
+
+  if (action === "open-content-manage") {
+    state.ui.contentManageMode = true;
+    state.ui.contentManageSelections = [];
+    await refreshContentSchedules({ render: false });
+    renderWorkspace();
+    scrollToElement(".content-library-panel--sets", { block: "start" });
+    return;
+  }
+
+  if (action === "open-content-automation") {
+    state.ui.contentManageMode = true;
+    state.ui.contentManageSelections = [];
+    await refreshContentSchedules({ render: false });
+    renderWorkspace();
+    scrollToElement(".content-library-panel--automation", { block: "start" });
     return;
   }
 
@@ -4549,11 +5631,14 @@ async function handleAction(button) {
       return;
     }
     const existing = getContentImageMeta(imageName).editRecipe;
+    const draft = existing ? { ...getDefaultEditRecipe(), ...existing, targetScreenId: null } : getDefaultEditRecipe();
     state.ui.contentEdit = {
       imageName,
-      draft: existing ? { ...getDefaultEditRecipe(), ...existing } : getDefaultEditRecipe(),
+      draft,
       dirty: false,
-      saving: false
+      saving: false,
+      confirmDiscard: false,
+      cropMode: isManualCropDraft(draft) ? "manual" : "preset"
     };
     state.ui.modal = "content-edit";
     renderWorkspace();
@@ -4572,6 +5657,7 @@ async function handleAction(button) {
       draft[field] = rawValue;
     }
     state.ui.contentEdit.dirty = true;
+    state.ui.contentEdit.confirmDiscard = false;
     renderWorkspace();
     return;
   }
@@ -4580,17 +5666,76 @@ async function handleAction(button) {
     if (!state.ui.contentEdit) return;
     state.ui.contentEdit.draft = getDefaultEditRecipe();
     state.ui.contentEdit.dirty = true;
+    state.ui.contentEdit.confirmDiscard = false;
+    state.ui.contentEdit.cropMode = "preset";
+    renderWorkspace();
+    return;
+  }
+
+  if (action === "set-content-edit-crop-mode") {
+    if (!state.ui.contentEdit) return;
+    const nextMode = button.dataset.mode === "manual" ? "manual" : "preset";
+    state.ui.contentEdit.cropMode = nextMode;
+    if (nextMode === "preset") {
+      const draft = state.ui.contentEdit.draft;
+      const changed = draft.zoom !== EDIT_RECIPE_DEFAULTS.zoom
+        || draft.panX !== EDIT_RECIPE_DEFAULTS.panX
+        || draft.panY !== EDIT_RECIPE_DEFAULTS.panY;
+      draft.zoom = EDIT_RECIPE_DEFAULTS.zoom;
+      draft.panX = EDIT_RECIPE_DEFAULTS.panX;
+      draft.panY = EDIT_RECIPE_DEFAULTS.panY;
+      if (changed) {
+        state.ui.contentEdit.dirty = true;
+      }
+    }
+    state.ui.contentEdit.confirmDiscard = false;
+    renderWorkspace();
+    return;
+  }
+
+  if (action === "reset-content-edit-framing") {
+    if (!state.ui.contentEdit) return;
+    const draft = state.ui.contentEdit.draft;
+    const changed = draft.fit !== EDIT_RECIPE_DEFAULTS.fit
+      || draft.cropAnchor !== EDIT_RECIPE_DEFAULTS.cropAnchor
+      || draft.zoom !== EDIT_RECIPE_DEFAULTS.zoom
+      || draft.panX !== EDIT_RECIPE_DEFAULTS.panX
+      || draft.panY !== EDIT_RECIPE_DEFAULTS.panY;
+    draft.fit = EDIT_RECIPE_DEFAULTS.fit;
+    draft.cropAnchor = EDIT_RECIPE_DEFAULTS.cropAnchor;
+    draft.zoom = EDIT_RECIPE_DEFAULTS.zoom;
+    draft.panX = EDIT_RECIPE_DEFAULTS.panX;
+    draft.panY = EDIT_RECIPE_DEFAULTS.panY;
+    state.ui.contentEdit.cropMode = "preset";
+    if (changed) {
+      state.ui.contentEdit.dirty = true;
+    }
+    state.ui.contentEdit.confirmDiscard = false;
     renderWorkspace();
     return;
   }
 
   if (action === "cancel-content-edit") {
     if (state.ui.contentEdit?.dirty) {
-      const confirmed = window.confirm("Discard your unsaved edits?");
-      if (!confirmed) {
-        return;
-      }
+      state.ui.contentEdit.confirmDiscard = true;
+      renderWorkspace();
+      return;
     }
+    state.ui.contentEdit = null;
+    state.ui.modal = null;
+    renderWorkspace();
+    return;
+  }
+
+  if (action === "dismiss-content-edit-discard") {
+    if (state.ui.contentEdit) {
+      state.ui.contentEdit.confirmDiscard = false;
+      renderWorkspace();
+    }
+    return;
+  }
+
+  if (action === "confirm-content-edit-discard") {
     state.ui.contentEdit = null;
     state.ui.modal = null;
     renderWorkspace();
@@ -4601,6 +5746,7 @@ async function handleAction(button) {
     if (!state.ui.contentEdit?.imageName) return;
     const saveAsCopy = action === "save-content-edit-copy";
     state.ui.contentEdit.saving = true;
+    state.ui.contentEdit.confirmDiscard = false;
     renderWorkspace();
     try {
       const encodedName = encodeURIComponent(state.ui.contentEdit.imageName);
@@ -4826,6 +5972,7 @@ async function handleAction(button) {
     state.ui.modal = null;
     state.ui.screenId = null;
     state.ui.screenDraft = null;
+    state.ui.contentScheduleDraft = null;
     state.ui.pendingDeleteNames = [];
     state.ui.pendingImportedDeleteSlugs = [];
     state.ui.spotifySettingsDraft = null;
@@ -5181,13 +6328,17 @@ function bindContentEditForm() {
     return;
   }
   const previewImg = document.getElementById("content-edit-preview-img");
+  let previewTimer = null;
 
   const applyLiveUpdate = () => {
     if (!state.ui.contentEdit) return;
     const draft = state.ui.contentEdit.draft;
     if (previewImg) {
-      previewImg.style.filter = buildEditPreviewFilter(draft);
-      previewImg.style.transform = `rotate(${draft.rotate}deg)`;
+      const nextUrl = buildContentEditPreviewUrl(state.ui.contentEdit.imageName, draft, Date.now());
+      clearTimeout(previewTimer);
+      previewTimer = setTimeout(() => {
+        previewImg.src = nextUrl;
+      }, 90);
     }
     form.querySelectorAll("[data-value-for]").forEach((el) => {
       const field = el.dataset.valueFor;
@@ -5209,6 +6360,9 @@ function bindContentEditForm() {
       draft[name] = target.checked;
     } else if (target.type === "range") {
       draft[name] = Number(target.value);
+      if (name === "zoom" || name === "panX" || name === "panY") {
+        state.ui.contentEdit.cropMode = "manual";
+      }
     } else if (target.tagName === "SELECT") {
       if (name === "targetScreenId") {
         draft[name] = target.value || null;
@@ -5219,13 +6373,96 @@ function bindContentEditForm() {
       draft[name] = target.value;
     }
     state.ui.contentEdit.dirty = true;
+    state.ui.contentEdit.confirmDiscard = false;
     applyLiveUpdate();
   });
+}
 
-  form.addEventListener("change", (event) => {
-    if (event.target?.tagName === "SELECT" && event.target.name === "targetScreenId") {
+function bindContentSetEditorForm() {
+  const nameInput = document.getElementById("content-set-editor-name");
+  nameInput?.addEventListener("change", (event) => {
+    const setId = event.target.dataset.setId || "";
+    const nextName = event.target.value.trim();
+    if (!nextName) {
       renderWorkspace();
+      return;
     }
+    const set = updateContentSet(setId, (current) => ({
+      ...current,
+      name: nextName
+    }));
+    if (!set) {
+      return;
+    }
+    persistProject();
+    renderWorkspace();
+  });
+
+  const wallSelect = document.getElementById("content-set-editor-wall");
+  wallSelect?.addEventListener("change", (event) => {
+    const setId = event.target.dataset.setId || "";
+    const set = updateContentSet(setId, (current) => ({
+      ...current,
+      wallId: event.target.value || ""
+    }));
+    if (!set) {
+      return;
+    }
+    persistProject();
+    renderWorkspace();
+  });
+
+  app.querySelectorAll("[data-set-slot-input]").forEach((select) => {
+    select.addEventListener("change", (event) => {
+      const setId = event.target.dataset.setId || "";
+      const imageName = event.target.dataset.imageName || "";
+      const nextSlot = CONTENT_SET_SLOTS.has(String(event.target.value || "").trim()) ? String(event.target.value).trim() : "";
+      const set = updateContentSet(setId, (current) => ({
+        ...current,
+        items: (current.items || []).map((item) => (
+          item.imageName === imageName
+            ? { ...item, slot: nextSlot }
+            : item
+        ))
+      }));
+      if (!set) {
+        return;
+      }
+      persistProject();
+      renderWorkspace();
+    });
+  });
+}
+
+function bindContentScheduleForm() {
+  if (state.ui.modal !== "content-schedule" || !state.ui.contentScheduleDraft) {
+    return;
+  }
+
+  document.getElementById("content-schedule-name")?.addEventListener("input", (event) => {
+    if (state.ui.contentScheduleDraft) {
+      state.ui.contentScheduleDraft.name = event.target.value;
+    }
+  });
+
+  document.getElementById("content-schedule-datetime")?.addEventListener("input", (event) => {
+    if (state.ui.contentScheduleDraft) {
+      state.ui.contentScheduleDraft.datetimeLocal = event.target.value;
+    }
+  });
+
+  document.getElementById("content-schedule-enabled")?.addEventListener("change", (event) => {
+    if (state.ui.contentScheduleDraft) {
+      state.ui.contentScheduleDraft.enabled = Boolean(event.target.checked);
+    }
+  });
+
+  document.getElementById("content-schedule-recurrence")?.addEventListener("change", (event) => {
+    if (!state.ui.contentScheduleDraft) {
+      return;
+    }
+    state.ui.contentScheduleDraft.recurrence = event.target.value;
+    renderWorkspace();
   });
 }
 

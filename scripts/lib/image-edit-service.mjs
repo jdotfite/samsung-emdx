@@ -10,11 +10,15 @@ const DEFAULT_RECIPE = Object.freeze({
   fit: "contain",
   cropAnchor: "center",
   rotate: 0,
+  zoom: 1,
+  panX: 0,
+  panY: 0,
   grayscale: false,
   invert: false,
   brightness: 1,
   contrast: 1,
   gamma: 1,
+  vibrance: 1,
   sharpen: 0,
   blur: 0,
   blackPoint: 0,
@@ -40,23 +44,25 @@ export function normalizeEditRecipe(input) {
   const fit = FIT_MODES.has(input.fit) ? input.fit : DEFAULT_RECIPE.fit;
   const cropAnchor = CROP_ANCHORS.has(input.cropAnchor) ? input.cropAnchor : DEFAULT_RECIPE.cropAnchor;
   const rotate = ROTATIONS.has(Number(input.rotate)) ? Number(input.rotate) : DEFAULT_RECIPE.rotate;
+  const zoom = clamp(Number(input.zoom), 1, 3) ?? DEFAULT_RECIPE.zoom;
+  const panX = clamp(Number(input.panX), -1, 1) ?? DEFAULT_RECIPE.panX;
+  const panY = clamp(Number(input.panY), -1, 1) ?? DEFAULT_RECIPE.panY;
   const grayscale = Boolean(input.grayscale);
   const invert = Boolean(input.invert);
   const brightness = clamp(Number(input.brightness), 0.5, 1.5) ?? DEFAULT_RECIPE.brightness;
   const contrast = clamp(Number(input.contrast), 0.5, 1.5) ?? DEFAULT_RECIPE.contrast;
   const gamma = clamp(Number(input.gamma), 1, 3) ?? DEFAULT_RECIPE.gamma;
+  const vibrance = clamp(Number(input.vibrance), 0.5, 1.8) ?? DEFAULT_RECIPE.vibrance;
   const sharpen = clamp(Number(input.sharpen), 0, 5) ?? DEFAULT_RECIPE.sharpen;
   const blur = clamp(Number(input.blur), 0, 5) ?? DEFAULT_RECIPE.blur;
   const blackPoint = clamp(Number(input.blackPoint), 0, 0.4) ?? DEFAULT_RECIPE.blackPoint;
   const whitePoint = clamp(Number(input.whitePoint), 0.6, 1) ?? DEFAULT_RECIPE.whitePoint;
-  const targetScreenId = typeof input.targetScreenId === "string" && input.targetScreenId.trim()
-    ? input.targetScreenId.trim()
-    : null;
+  const targetScreenId = null;
   const updatedAt = typeof input.updatedAt === "string" && input.updatedAt
     ? input.updatedAt
     : new Date().toISOString();
 
-  if (isDefaultRecipe({ fit, cropAnchor, rotate, grayscale, invert, brightness, contrast, gamma, sharpen, blur, blackPoint, whitePoint, targetScreenId })) {
+  if (isDefaultRecipe({ fit, cropAnchor, rotate, zoom, panX, panY, grayscale, invert, brightness, contrast, gamma, vibrance, sharpen, blur, blackPoint, whitePoint, targetScreenId })) {
     return null;
   }
 
@@ -64,11 +70,15 @@ export function normalizeEditRecipe(input) {
     fit,
     cropAnchor,
     rotate,
+    zoom,
+    panX,
+    panY,
     grayscale,
     invert,
     brightness,
     contrast,
     gamma,
+    vibrance,
     sharpen,
     blur,
     blackPoint,
@@ -86,11 +96,15 @@ export function isDefaultRecipe(recipe) {
     recipe.fit === DEFAULT_RECIPE.fit &&
     recipe.cropAnchor === DEFAULT_RECIPE.cropAnchor &&
     recipe.rotate === DEFAULT_RECIPE.rotate &&
+    recipe.zoom === DEFAULT_RECIPE.zoom &&
+    recipe.panX === DEFAULT_RECIPE.panX &&
+    recipe.panY === DEFAULT_RECIPE.panY &&
     recipe.grayscale === DEFAULT_RECIPE.grayscale &&
     recipe.invert === DEFAULT_RECIPE.invert &&
     recipe.brightness === DEFAULT_RECIPE.brightness &&
     recipe.contrast === DEFAULT_RECIPE.contrast &&
     recipe.gamma === DEFAULT_RECIPE.gamma &&
+    recipe.vibrance === DEFAULT_RECIPE.vibrance &&
     recipe.sharpen === DEFAULT_RECIPE.sharpen &&
     recipe.blur === DEFAULT_RECIPE.blur &&
     recipe.blackPoint === DEFAULT_RECIPE.blackPoint &&
@@ -109,26 +123,107 @@ function anchorToPosition(anchor) {
   }
 }
 
+function anchorToBias(anchor) {
+  switch (anchor) {
+    case "top":
+      return { x: 0.5, y: 0 };
+    case "bottom":
+      return { x: 0.5, y: 1 };
+    case "left":
+      return { x: 0, y: 0.5 };
+    case "right":
+      return { x: 1, y: 0.5 };
+    default:
+      return { x: 0.5, y: 0.5 };
+  }
+}
+
+function clampToRange(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}
+
 export async function applyEditRecipe(sourcePath, recipe, { targetWidth, targetHeight, outputFormat } = {}) {
   const normalized = normalizeEditRecipe(recipe);
-  let pipeline = sharp(sourcePath, { failOn: "none" }).rotate();
+  let basePipeline = sharp(sourcePath, { failOn: "none" }).rotate();
 
   if (normalized?.rotate) {
-    pipeline = pipeline.rotate(normalized.rotate);
+    basePipeline = basePipeline.rotate(normalized.rotate);
   }
 
+  const baseBuffer = await basePipeline.toBuffer();
+  let pipeline = sharp(baseBuffer, { failOn: "none" });
+
   if (targetWidth && targetHeight && normalized) {
+    const metadata = await sharp(baseBuffer, { failOn: "none" }).metadata();
+    const sourceWidth = metadata.width || targetWidth;
+    const sourceHeight = metadata.height || targetHeight;
+    const baseScale = normalized.fit === "cover"
+      ? Math.max(targetWidth / sourceWidth, targetHeight / sourceHeight)
+      : Math.min(targetWidth / sourceWidth, targetHeight / sourceHeight);
+    const finalScale = Math.max(0.01, baseScale * normalized.zoom);
+    const resizedWidth = Math.max(1, Math.round(sourceWidth * finalScale));
+    const resizedHeight = Math.max(1, Math.round(sourceHeight * finalScale));
+    const resizedBuffer = await sharp(baseBuffer, { failOn: "none" })
+      .resize({
+        width: resizedWidth,
+        height: resizedHeight,
+        fit: "fill",
+        withoutEnlargement: false
+      })
+      .toBuffer();
+
+    const anchorBias = anchorToBias(normalized.cropAnchor);
+    const minLeft = Math.min(0, targetWidth - resizedWidth);
+    const maxLeft = Math.max(0, targetWidth - resizedWidth);
+    const minTop = Math.min(0, targetHeight - resizedHeight);
+    const maxTop = Math.max(0, targetHeight - resizedHeight);
+    const anchorLeft = minLeft + ((maxLeft - minLeft) * anchorBias.x);
+    const anchorTop = minTop + ((maxTop - minTop) * anchorBias.y);
+    const panRangeX = Math.abs(maxLeft - minLeft) / 2;
+    const panRangeY = Math.abs(maxTop - minTop) / 2;
+    const left = Math.round(clampToRange(anchorLeft + (normalized.panX * panRangeX), minLeft, maxLeft));
+    const top = Math.round(clampToRange(anchorTop + (normalized.panY * panRangeY), minTop, maxTop));
+    const inputLeft = Math.max(0, -left);
+    const inputTop = Math.max(0, -top);
+    const outputLeft = Math.max(0, left);
+    const outputTop = Math.max(0, top);
+    const visibleWidth = Math.max(1, Math.min(resizedWidth - inputLeft, targetWidth - outputLeft));
+    const visibleHeight = Math.max(1, Math.min(resizedHeight - inputTop, targetHeight - outputTop));
+    const visibleBuffer = (inputLeft || inputTop || visibleWidth !== resizedWidth || visibleHeight !== resizedHeight)
+      ? await sharp(resizedBuffer, { failOn: "none" })
+          .extract({
+            left: inputLeft,
+            top: inputTop,
+            width: visibleWidth,
+            height: visibleHeight
+          })
+          .toBuffer()
+      : resizedBuffer;
+
+    pipeline = sharp({
+      create: {
+        width: targetWidth,
+        height: targetHeight,
+        channels: 4,
+        background: { r: 255, g: 255, b: 255, alpha: 1 }
+      }
+    }).composite([{ input: visibleBuffer, left: outputLeft, top: outputTop }]);
+  } else if (targetWidth && targetHeight) {
     pipeline = pipeline.resize({
       width: targetWidth,
       height: targetHeight,
-      fit: normalized.fit,
-      position: anchorToPosition(normalized.cropAnchor),
-      withoutEnlargement: false
+      fit: "contain",
+      position: anchorToPosition("center"),
+      withoutEnlargement: false,
+      background: { r: 255, g: 255, b: 255, alpha: 1 }
     });
   }
 
   if (normalized) {
     const needsLevels = normalized.blackPoint > 0 || normalized.whitePoint < 1;
+    if (normalized.vibrance !== 1) {
+      pipeline = pipeline.modulate({ saturation: normalized.vibrance });
+    }
     if (normalized.gamma && normalized.gamma !== 1) {
       pipeline = pipeline.gamma(normalized.gamma);
     }
