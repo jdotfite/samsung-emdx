@@ -144,3 +144,23 @@ export async function sendImageToScreens({
     onProgress
   });
 }
+
+export async function sendImagesToScreens({
+  screens,
+  imagePathByScreenId,
+  dryRun = false,
+  onProgress
+}) {
+  return sendWithImagePaths({
+    screens,
+    dryRun,
+    resolveImagePath: async (screen) => {
+      const imagePath = imagePathByScreenId[screen.id];
+      if (!imagePath) {
+        throw new Error(`No image mapped for screen "${screen.id}"`);
+      }
+      return imagePath;
+    },
+    onProgress
+  });
+}

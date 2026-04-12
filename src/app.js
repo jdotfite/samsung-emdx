@@ -1092,6 +1092,37 @@ function assignImagesToCollection(imageNames, collectionId) {
   return changed;
 }
 
+function createContentSet(name, imageNames) {
+  const trimmed = String(name || "").trim();
+  if (!trimmed) return null;
+  const uniqueNames = [...new Set(imageNames.filter(Boolean))];
+  if (uniqueNames.length < 2) return null;
+  const id = createLocationId(`set-${trimmed}-${Date.now()}`);
+  const set = {
+    id,
+    name: trimmed,
+    collectionId: "",
+    items: uniqueNames.map((imageName, index) => ({ imageName, position: index + 1 }))
+  };
+  state.project.contentLibrary.sets = [...(state.project.contentLibrary.sets || []), set];
+  state.project.contentLibrary = normalizeContentLibrary(state.project.contentLibrary);
+  return state.project.contentLibrary.sets.find((entry) => entry.id === id) || set;
+}
+
+function deleteContentSet(setId) {
+  const before = (state.project.contentLibrary.sets || []).length;
+  state.project.contentLibrary.sets = (state.project.contentLibrary.sets || []).filter((set) => set.id !== setId);
+  const removed = before !== state.project.contentLibrary.sets.length;
+  if (removed) {
+    state.project.contentLibrary = normalizeContentLibrary(state.project.contentLibrary);
+  }
+  return removed;
+}
+
+function getContentSetById(setId) {
+  return (getContentLibrary().sets || []).find((set) => set.id === setId) || null;
+}
+
 function clearImagesFromCollections(imageNames) {
   const names = [...new Set(imageNames.filter(Boolean))];
   let changed = 0;
@@ -1833,6 +1864,66 @@ function createContentBrowseCollectionsPanel() {
   `;
 }
 
+function createContentSetsPanel() {
+  const sets = getContentLibrary().sets || [];
+  if (!sets.length) return "";
+  const enabledScreens = state.project.screens.filter((screen) => screen.enabled);
+  return `
+    <section class="content-library-panel content-library-panel--sets">
+      <div class="content-library-copy">
+        <span class="device-summary-kicker">Ordered Sets</span>
+        <strong>${sets.length} set${sets.length === 1 ? "" : "s"} ready to send</strong>
+        <span>Each set maps position 1..N to the first ${enabledScreens.length} enabled frame${enabledScreens.length === 1 ? "" : "s"}. Send Set dispatches every position in parallel.</span>
+      </div>
+      <div class="content-set-grid">
+        ${sets.map((set) => createContentSetCard(set, enabledScreens)).join("")}
+      </div>
+    </section>
+  `;
+}
+
+function createContentSetCard(set, enabledScreens) {
+  const positions = set.items || [];
+  const canSend = positions.length > 0 && enabledScreens.length >= positions.length;
+  const imagesByName = new Map(state.outputImages.map((image) => [image.name, image]));
+  const thumbs = positions.map((item) => {
+    const image = imagesByName.get(item.imageName);
+    const src = image ? `${image.url}?t=${encodeURIComponent(image.modifiedAt)}` : "";
+    const targetScreen = enabledScreens[item.position - 1] || null;
+    const mapLabel = targetScreen ? targetScreen.name : "No frame";
+    return `
+      <div class="content-set-thumb">
+        <div class="content-set-thumb-image">
+          ${src ? `<img src="${src}" alt="${item.imageName}" />` : `<span class="content-set-thumb-missing">Missing</span>`}
+          <span class="content-set-position-badge">${item.position}</span>
+        </div>
+        <div class="content-set-thumb-meta">
+          <strong>${item.imageName}</strong>
+          <span>→ ${mapLabel}</span>
+        </div>
+      </div>
+    `;
+  }).join("");
+  const sendTitle = canSend
+    ? `Send ${set.name} to ${positions.length} frame${positions.length === 1 ? "" : "s"}`
+    : `Enable at least ${positions.length} frame${positions.length === 1 ? "" : "s"} to send this set`;
+  return `
+    <article class="content-set-card" data-set-id="${set.id}">
+      <header class="content-set-card-header">
+        <div class="content-set-card-copy">
+          <strong>${set.name}</strong>
+          <span>${positions.length} position${positions.length === 1 ? "" : "s"}</span>
+        </div>
+        <button type="button" class="icon-button icon-button--ghost icon-button--small" data-action="delete-content-set" data-set-id="${set.id}" aria-label="Delete set">×</button>
+      </header>
+      <div class="content-set-card-thumbs">${thumbs}</div>
+      <footer class="content-set-card-footer">
+        <button type="button" data-action="send-content-set" data-set-id="${set.id}" ${canSend ? "" : "disabled"} title="${sendTitle}">Send Set</button>
+      </footer>
+    </article>
+  `;
+}
+
 function createContentBrowseToolbar() {
   const query = state.ui.contentLibrarySearch || "";
   const sortKey = state.ui.contentLibrarySort || "recent";
@@ -1902,9 +1993,15 @@ function createContentManagePanel() {
           <strong>Organize posters into collections</strong>
           <span>Select posters below, create a collection if needed, then assign the selection. Collections are for browseable themes. Ordered sets stay reserved for multi-frame layouts.</span>
         </div>
-        <div class="spotify-search-row manage-search-row content-library-create-row">
-          <input id="content-collection-name" type="text" placeholder="Create collection, like Movie Posters" />
-          <button type="button" data-action="create-content-collection">Create Collection</button>
+        <div class="content-library-create-stack">
+          <div class="spotify-search-row manage-search-row content-library-create-row">
+            <input id="content-collection-name" type="text" placeholder="Create collection, like Movie Posters" />
+            <button type="button" data-action="create-content-collection">Create Collection</button>
+          </div>
+          <div class="spotify-search-row manage-search-row content-library-create-row">
+            <input id="content-set-name" type="text" placeholder="Create ordered set from selection, like Triptych" />
+            <button type="button" data-action="create-content-set" ${selectedCount >= 2 ? "" : "disabled"}>Create Set${selectedCount >= 2 ? ` (${selectedCount})` : ""}</button>
+          </div>
         </div>
       </div>
       <div class="content-manage-steps">
@@ -3397,6 +3494,7 @@ function createSectionPanel() {
                 </div>
               </div>
               ${createContentBrowseCollectionsPanel()}
+              ${createContentSetsPanel()}
               ${createContentCollectionScopePanel()}
               ${createContentBrowseToolbar()}
             `
@@ -4148,6 +4246,99 @@ async function handleAction(button) {
       ? `Added ${changed} poster${changed === 1 ? "" : "s"} to ${collection.name}.`
       : `${collection.name} already contains those images.`;
     state.actions.error = "";
+    renderWorkspace();
+    return;
+  }
+
+  if (action === "create-content-set") {
+    const input = document.getElementById("content-set-name");
+    const rawName = input?.value?.trim() || "";
+    if (!rawName) {
+      state.actions.error = "Enter a set name first.";
+      renderWorkspace();
+      return;
+    }
+    const selection = [...state.ui.contentManageSelections];
+    if (selection.length < 2) {
+      state.actions.error = "Select at least 2 images in the order you want them assigned to frames.";
+      renderWorkspace();
+      return;
+    }
+    const set = createContentSet(rawName, selection);
+    if (!set) {
+      state.actions.error = "Could not create set.";
+      renderWorkspace();
+      return;
+    }
+    persistProject();
+    if (input) input.value = "";
+    state.ui.contentManageSelections = [];
+    state.actions.notice = `Created set ${set.name} with ${set.items.length} position${set.items.length === 1 ? "" : "s"}.`;
+    state.actions.error = "";
+    renderWorkspace();
+    return;
+  }
+
+  if (action === "delete-content-set") {
+    const setId = button.dataset.setId || "";
+    const set = getContentSetById(setId);
+    if (!set) {
+      renderWorkspace();
+      return;
+    }
+    deleteContentSet(setId);
+    persistProject();
+    state.actions.notice = `Deleted set ${set.name}.`;
+    state.actions.error = "";
+    renderWorkspace();
+    return;
+  }
+
+  if (action === "send-content-set") {
+    const setId = button.dataset.setId || "";
+    const set = getContentSetById(setId);
+    if (!set) {
+      state.actions.error = "Set not found.";
+      renderWorkspace();
+      return;
+    }
+    const enabledScreens = state.project.screens.filter((screen) => screen.enabled);
+    const positions = set.items || [];
+    if (enabledScreens.length < positions.length) {
+      state.actions.error = `Enable at least ${positions.length} frame${positions.length === 1 ? "" : "s"} before sending this set.`;
+      renderWorkspace();
+      return;
+    }
+    const mappedScreenIds = positions.map((_, index) => enabledScreens[index].id);
+    const targetNames = positions.map((_, index) => enabledScreens[index].name);
+    state.ui.sendFlow = createPendingSendFlow({
+      imageName: `Set: ${set.name}`,
+      targetNames
+    });
+    renderWorkspace();
+    try {
+      const payload = await apiPostJson("/api/content/send-set", {
+        setId,
+        screenIds: mappedScreenIds
+      });
+      state.ui.sendFlow.jobId = payload.jobId;
+      state.ui.sendFlow.status = "running";
+      await pollSendFlowJob(payload.jobId, { immediate: true });
+    } catch (error) {
+      state.actions.error = error.message;
+      stopSendFlowPolling();
+      state.ui.sendFlow = {
+        ...(state.ui.sendFlow || {}),
+        active: true,
+        status: "failed",
+        error: error.message,
+        progress: 12,
+        steps: (state.ui.sendFlow?.steps || []).map((step, index) => ({
+          ...step,
+          state: index === 0 ? "error" : "pending"
+        }))
+      };
+    }
     renderWorkspace();
     return;
   }

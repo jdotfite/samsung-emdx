@@ -80,6 +80,26 @@ test.describe("Content library", () => {
     expect(namesDesc[1]).toContain("fixture-landscape");
   });
 
+  test("manage mode creates an ordered set from selection", async ({ page }) => {
+    await goToContent(page);
+    await page.locator('[data-action="toggle-content-manage"]').click();
+    await expect(page.locator(".content-library-panel--manage")).toBeVisible();
+
+    await page.locator(".output-card", { hasText: "fixture-portrait" }).locator(".output-card-preview").click();
+    await page.locator(".output-card", { hasText: "fixture-landscape" }).locator(".output-card-preview").click();
+
+    await page.locator("#content-set-name").fill("Test Triptych");
+    await page.locator('[data-action="create-content-set"]').click();
+
+    await page.locator('[data-action="toggle-content-manage"]').click();
+
+    const setCard = page.locator(".content-set-card", { hasText: "Test Triptych" });
+    await expect(setCard).toBeVisible();
+    await expect(setCard.locator(".content-set-position-badge")).toHaveCount(2);
+    await expect(setCard.locator(".content-set-position-badge").first()).toContainText("1");
+    await expect(setCard.locator(".content-set-position-badge").nth(1)).toContainText("2");
+  });
+
   test("manage mode creates and assigns a collection", async ({ page }) => {
     await goToContent(page);
     await page.locator('[data-action="toggle-content-manage"]').click();

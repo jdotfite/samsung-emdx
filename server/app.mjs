@@ -25,7 +25,7 @@ import {
 } from "./send-job-store.mjs";
 import { selectScreens } from "../scripts/lib/project-config.mjs";
 import { renderScreens } from "../scripts/lib/render-service.mjs";
-import { sendImageToScreens, sendScreens } from "../scripts/lib/send-service.mjs";
+import { sendImageToScreens, sendImagesToScreens, sendScreens } from "../scripts/lib/send-service.mjs";
 import { DEFAULT_PROJECT } from "../src/default-project.js";
 
 const rootDir = process.cwd();
@@ -124,6 +124,34 @@ async function listOutputImages() {
 
 function editCachePathFor(imageName) {
   return path.join(editCacheDir, imageName);
+}
+
+async function resolveContentImagePath(project, imageName) {
+  if (path.basename(imageName) !== imageName) {
+    throw Object.assign(new Error(`Invalid image name: ${imageName}`), { statusCode: 400 });
+  }
+  const sourcePath = path.resolve(outputDir, imageName);
+  if (!sourcePath.startsWith(path.resolve(outputDir) + path.sep)) {
+    throw Object.assign(new Error(`Invalid image path: ${imageName}`), { statusCode: 400 });
+  }
+  await fs.promises.access(sourcePath, fs.constants.R_OK);
+  const editRecipe = project.contentLibrary?.items?.[imageName]?.editRecipe || null;
+  if (!editRecipe) return sourcePath;
+  const cachePath = editCachePathFor(imageName);
+  try {
+    await fs.promises.access(cachePath, fs.constants.R_OK);
+    return cachePath;
+  } catch {}
+  const targetScreen = editRecipe.targetScreenId
+    ? project.screens.find((screen) => screen.id === editRecipe.targetScreenId)
+    : null;
+  const buffer = await applyEditRecipe(sourcePath, editRecipe, {
+    targetWidth: targetScreen?.size?.width || null,
+    targetHeight: targetScreen?.size?.height || null,
+    outputFormat: path.extname(imageName).slice(1)
+  });
+  await writeEditCache(cachePath, buffer);
+  return cachePath;
 }
 
 async function removeEditCache(imageName) {
@@ -545,6 +573,104 @@ export async function startAppServer({ host = env.appHost, port = env.appPort } 
       res.status(202).json({
         ok: true,
         imageName,
+        jobId: job.id
+      });
+    } catch (error) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.post("/api/content/send-set", async (req, res) => {
+    try {
+      const setId = String(req.body.setId || "").trim();
+      const requestedIds = Array.isArray(req.body.screenIds) ? req.body.screenIds : [];
+
+      if (!setId) {
+        res.status(400).json({ error: "setId is required." });
+        return;
+      }
+
+      const project = loadProjectFromStore();
+      const set = (project.contentLibrary?.sets || []).find((entry) => entry.id === setId);
+      if (!set) {
+        res.status(404).json({ error: `Set not found: ${setId}` });
+        return;
+      }
+
+      const positions = [...(set.items || [])].sort((a, b) => a.position - b.position);
+      if (!positions.length) {
+        res.status(400).json({ error: "Set has no items." });
+        return;
+      }
+
+      if (requestedIds.length !== positions.length) {
+        res.status(400).json({ error: `Expected ${positions.length} screenIds, got ${requestedIds.length}.` });
+        return;
+      }
+
+      const screens = [];
+      const imagePathByScreenId = {};
+      for (let i = 0; i < positions.length; i += 1) {
+        const screenId = requestedIds[i];
+        const screen = project.screens.find((entry) => entry.id === screenId && entry.enabled);
+        if (!screen) {
+          res.status(400).json({ error: `Unknown or disabled screen: ${screenId}` });
+          return;
+        }
+        if (screens.some((entry) => entry.id === screen.id)) {
+          res.status(400).json({ error: `Screen ${screen.id} is mapped to multiple positions.` });
+          return;
+        }
+        let imagePath;
+        try {
+          imagePath = await resolveContentImagePath(project, positions[i].imageName);
+        } catch (err) {
+          const status = err.statusCode || 500;
+          res.status(status).json({ error: err.message });
+          return;
+        }
+        screens.push(screen);
+        imagePathByScreenId[screen.id] = imagePath;
+      }
+
+      const job = createSendJob({
+        imageName: `Set: ${set.name}`,
+        screens
+      });
+
+      markSendJobRunning(job.id);
+
+      void (async () => {
+        try {
+          const results = await sendImagesToScreens({
+            screens,
+            imagePathByScreenId,
+            onProgress: (screen, event) => {
+              recordSendJobEvent(job.id, screen.id, event);
+            }
+          });
+
+          for (const result of results) {
+            completeSendJobTarget(job.id, result.screenId, result);
+          }
+          recordSentImages(results);
+
+          const finalJob = getSendJob(job.id);
+          const hasUnverified = finalJob?.targets.some((t) => t.status === "unverified");
+          if (hasUnverified) {
+            failSendJob(job.id, "One or more frames did not confirm image receipt. Try waking the display and sending again.");
+          } else {
+            finishSendJob(job.id);
+          }
+        } catch (error) {
+          failSendJob(job.id, error.message || "Send failed.");
+        }
+      })();
+
+      res.status(202).json({
+        ok: true,
+        setId,
+        setName: set.name,
         jobId: job.id
       });
     } catch (error) {

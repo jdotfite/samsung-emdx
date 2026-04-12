@@ -1761,6 +1761,132 @@ textarea {
   gap: 16px;
 }
 
+.content-library-panel--sets {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.content-library-create-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.content-set-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: 12px;
+}
+
+.content-set-card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.content-set-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+
+.content-set-card-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.content-set-card-copy strong {
+  font-size: 15px;
+}
+
+.content-set-card-copy span {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.content-set-card-thumbs {
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  padding-bottom: 4px;
+}
+
+.content-set-thumb {
+  flex: 0 0 auto;
+  width: 112px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.content-set-thumb-image {
+  position: relative;
+  aspect-ratio: 1;
+  background: var(--bg);
+  border-radius: 8px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.content-set-thumb-image img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.content-set-thumb-missing {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.content-set-position-badge {
+  position: absolute;
+  top: 4px;
+  left: 4px;
+  background: rgba(0, 0, 0, 0.7);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 6px;
+  border-radius: 10px;
+}
+
+.content-set-thumb-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.content-set-thumb-meta strong {
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.content-set-thumb-meta span {
+  font-size: 10px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.content-set-card-footer {
+  display: flex;
+  justify-content: flex-end;
+}
+
 .content-library-toolbar {
   display: flex;
   gap: 12px;
