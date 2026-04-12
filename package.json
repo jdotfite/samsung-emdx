@@ -8,7 +8,9 @@
     "send:dry": "node scripts/send.mjs --dry-run",
     "send": "node scripts/send.mjs",
     "render-send:dry": "node scripts/render-and-send.mjs --dry-run",
-    "render-send": "node scripts/render-and-send.mjs"
+    "render-send": "node scripts/render-and-send.mjs",
+    "test": "playwright test",
+    "test:headed": "playwright test --headed"
   },
   "keywords": [],
   "author": "",
@@ -24,5 +26,8 @@
     "playwright": "^1.54.0",
     "pngjs": "^7.0.0",
     "sharp": "^0.34.5"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.59.1"
   }
 }

@@ -6,3 +6,8 @@ assets/covers/imported/
 output/
 server.out
 server.err
+test-results/
+playwright-report/
+tests/fixtures/output/
+data/poster-wall-test*.db
+data/poster-wall-test*.db-*

@@ -11,6 +11,7 @@ export const env = {
   appHost: process.env.APP_HOST || "127.0.0.1",
   appPort: Number(process.env.APP_PORT || 4173),
   databasePath: toAbsolute(process.env.DATABASE_PATH || "./data/poster-wall.db"),
+  outputDir: toAbsolute(process.env.OUTPUT_DIR || "./output"),
   spotifyClientId: process.env.SPOTIFY_CLIENT_ID || "",
   spotifyClientSecret: process.env.SPOTIFY_CLIENT_SECRET || "",
   spotifyMarket: process.env.SPOTIFY_MARKET || "US",

@@ -29,7 +29,7 @@ import { sendImageToScreens, sendScreens } from "../scripts/lib/send-service.mjs
 import { DEFAULT_PROJECT } from "../src/default-project.js";
 
 const rootDir = process.cwd();
-const outputDir = path.join(rootDir, "output");
+const outputDir = env.outputDir;
 const editCacheDir = path.join(outputDir, ".edit-cache");
 const outputImagePattern = /\.(png|jpe?g|webp)$/i;
 
@@ -778,7 +778,7 @@ export async function startAppServer({ host = env.appHost, port = env.appPort } 
   app.use("/assets", express.static(path.join(rootDir, "assets"), { etag: false, maxAge: 0 }));
   app.use("/src", express.static(path.join(rootDir, "src"), { etag: false, maxAge: 0 }));
   app.use("/data", express.static(path.join(rootDir, "data"), { etag: false, maxAge: 0 }));
-  app.use("/output", express.static(path.join(rootDir, "output"), { etag: false, maxAge: 0 }));
+  app.use("/output", express.static(outputDir, { etag: false, maxAge: 0 }));
 
   app.get(/.*/, (req, res) => {
     res.sendFile(path.join(rootDir, "src", "index.html"));
