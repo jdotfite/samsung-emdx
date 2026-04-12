@@ -1,124 +1,130 @@
-# Poster Wall Control
+# Samsung EMDX Control App
 
-Local poster-wall system for Samsung EMDX displays with:
+A local control app for Samsung EMDX e-ink displays. Manages a content library of images, organizes them into collections and ordered wall layouts, edits images for e-ink display, and delivers them to Samsung frames over the local network with scheduling support.
 
-- a modular web UI for screen configuration and preview
-- a local backend for persistence and API integrations
-- SQLite-backed project storage
-- Spotify import for artist and playlist-driven album discovery
-- exact-size `PNG` and `JPG` export
-- Samsung EMDX delivery scripts driven by the same screen model
+## Product Surfaces
+
+### Devices
+
+Configure Samsung displays grouped by room and wall. Each screen has a name, resolution, Samsung EMDX connection details (host, pin, MAC), and a wall slot assignment (left, center, right) for ordered layouts. Rooms and walls give structure to multi-frame arrangements.
+
+### Content
+
+Browse, organize, edit, and send images to frames.
+
+- **Browse mode**: search, sort, preview, favorite, and send individual posters. Filter by collection, favorites, or search query. Sort by name, date, resolution, recently edited, or recently sent.
+- **Manage mode**: multi-select images to create collections (browseable themes) or ordered sets (multi-frame wall layouts like triptychs). Create and manage schedules for timed sends.
+- **Edit mode**: non-destructive image preparation for e-ink display. Frame crop (quick-fit presets or manual zoom/pan), color (grayscale, vibrance), levels (brightness, contrast, gamma, black/white point), detail (sharpen, blur), and rotation. All edits are recipe-based: the original is never modified.
+- **Ordered sets**: assign images to wall positions (left/center/right), map them to a physical wall, and send or schedule the entire layout as one action.
+- **Scheduling**: one-time, daily, or weekly automated sends for both single posters and wall layouts. Schedules are polled server-side every 30 seconds.
+
+### Studio
+
+Spotify-driven album discovery and poster generation.
+
+- Search for artists, browse their discography, or import albums from playlists.
+- Imported albums include cached cover art and extracted color palettes.
+- Generate posters from templates (`music-editorial-v1`, `music-minimal-v1`) into the shared Content library.
+
+### Delivery
+
+Wake-on-LAN, device status polling, and send-job tracking with real-time progress. Send jobs report per-target milestones: wake sent, content set, content JSON fetched, image fetched.
 
 ## Architecture
 
-- `server/env.mjs`: environment loading
-- `server/db.mjs`: SQLite connection and schema
-- `server/project-store.mjs`: saved project config
-- `server/album-store.mjs`: fixture + imported album catalog
-- `server/spotify-client.mjs`: Spotify API client
-- `server/spotify-importer.mjs`: album normalization, cover download, palette extraction
-- `server/app.mjs`: API server + static app hosting
-- `src/template-registry.js`: poster template registry
-- `src/templates/`: poster implementations
-- `scripts/export.mjs`: render all enabled screens from config
-- `scripts/send.mjs`: send rendered images to Samsung screens
-- `scripts/render-and-send.mjs`: render first, then send
+### Server
 
-## Configuration
+| File | Purpose |
+|---|---|
+| `server/app.mjs` | Express API server, static hosting, schedule polling |
+| `server/env.mjs` | Environment loading with defaults |
+| `server/db.mjs` | SQLite connection and schema (WAL mode) |
+| `server/project-store.mjs` | Project config persistence |
+| `server/album-store.mjs` | Album catalog (fixtures + imports) |
+| `server/device-state-store.mjs` | Per-screen last-sent state and preview snapshots |
+| `server/content-schedule-store.mjs` | Schedule persistence |
+| `server/send-job-store.mjs` | In-memory send job tracking |
+| `server/spotify-client.mjs` | Spotify Web API client |
+| `server/spotify-importer.mjs` | Album normalization, cover download, palette extraction |
+| `server/device-diagnostics.mjs` | Device wake and status via Samsung MDC |
+| `server/device-discovery.mjs` | Network scan for Samsung displays |
 
-Use `.env` for local secrets and machine-specific settings. `.env.example` shows the shape.
+### Client
 
-Important values:
+| File | Purpose |
+|---|---|
+| `src/app.js` | Single-page app with state management and DOM rendering |
+| `src/api.js` | Fetch helpers (GET, POST, PUT, DELETE JSON) |
+| `src/styles.css` | Full stylesheet |
+| `src/default-project.js` | Seed project with sample screens |
+| `src/templates/` | Poster template implementations |
 
-- `SPOTIFY_CLIENT_ID`
-- `SPOTIFY_CLIENT_SECRET`
-- `DATABASE_PATH`
-- `DEFAULT_LOCAL_IP`
-- `SAMSUNG_EMDX_BIN`
+### Scripts
 
-SQLite runs as a normal local file. Docker is not required for it.
+| File | Purpose |
+|---|---|
+| `scripts/server-dev.mjs` | Dev server launcher |
+| `scripts/export.mjs` | Headless render of all enabled screens to PNG/JPG |
+| `scripts/send.mjs` | CLI send to Samsung displays |
+| `scripts/render-and-send.mjs` | Render then send in one step |
+| `scripts/lib/image-edit-service.mjs` | Sharp-based edit recipe pipeline (rotate, resize, crop, tone, detail) |
+| `scripts/lib/send-service.mjs` | Samsung EMDX delivery with per-screen image path resolution |
+| `scripts/lib/samsung-emdx.mjs` | Low-level Samsung EMDX binary wrapper |
 
-## Screen Model
+## Setup
 
-The live project is stored in SQLite. `data/project.json` is now just a seed/example config.
-
-Each screen has:
-
-```json
-{
-  "id": "living-room-1",
-  "name": "Living Room 1",
-  "enabled": true,
-  "profile": "music",
-  "template": "music-editorial-v1",
-  "albumSlug": "ten",
-  "size": { "width": 1440, "height": 2560 },
-  "frame": {
-    "paddingTop": 60,
-    "paddingRight": 60,
-    "paddingBottom": 60,
-    "paddingLeft": 60,
-    "swatchCount": 5,
-    "imageFit": "cover"
-  },
-  "device": {
-    "host": "192.168.1.201",
-    "pin": "123456",
-    "mac": "",
-    "localIp": ""
-  }
-}
+```bash
+npm install
+cp .env.example .env   # fill in Spotify credentials and device IPs
+npm run dev             # starts at http://localhost:4173
 ```
 
-The output contract is consistent across screens, but each template can interpret the frame settings differently.
+### Environment Variables
+
+| Variable | Required | Description |
+|---|---|---|
+| `SPOTIFY_CLIENT_ID` | For Studio | Spotify app client ID |
+| `SPOTIFY_CLIENT_SECRET` | For Studio | Spotify app client secret |
+| `DATABASE_PATH` | No | SQLite path (default: `./data/poster-wall.db`) |
+| `DEFAULT_LOCAL_IP` | No | Local IP for Samsung EMDX content serving |
+| `SAMSUNG_EMDX_BIN` | No | Path to samsung-emdx binary |
+| `APP_PORT` | No | Server port (default: 4173) |
+| `OUTPUT_DIR` | No | Image output directory (default: `./output`) |
 
 ## Commands
 
 ```bash
-npm install
-npm run dev
-npm run export
-npm run send:dry
-npm run send
-npm run render-send:dry
-npm run render-send
+npm run dev             # start dev server
+npm run export          # headless render all enabled screens
+npm run send:dry        # dry-run send (shows commands without executing)
+npm run send            # send rendered images to displays
+npm run render-send:dry # render + dry-run send
+npm run render-send     # render + send
+npm test                # run Playwright e2e tests
+npm run test:headed     # run tests with visible browser
 ```
 
-Target a single screen:
+Target a single screen by name:
 
 ```bash
 node scripts/send.mjs living-room-1 --dry-run
 node scripts/render-and-send.mjs living-room-1
 ```
 
-Use a file config instead of the saved SQLite project:
+## Testing
+
+Playwright e2e tests cover the Content library flow: image metadata, preview modal, fit-check warnings, edit recipe round-trip, dirty-edit discard, manual crop mode, search/sort, favorites, ordered set creation, wall layout management, collection assignment, and scheduling.
 
 ```bash
-node scripts/export.mjs data/project.json
-node scripts/send.mjs data/project.json living-room-1 --dry-run
+npm test
 ```
 
-## Workflow
-
-1. Start the app with `npm run dev`.
-2. Edit screens and templates in the web UI.
-3. Search Spotify artists or import playlist albums into the local catalog.
-4. Assign imported albums to screens.
-5. Use the web UI or CLI to render one screen or the whole wall.
-6. Use dry-run send to inspect Samsung delivery commands.
-7. Send to displays when the device fields are correct.
-
-## Current Scope
-
-- portrait `9:16` screen defaults
-- `music-editorial-v1`
-- `music-minimal-v1`
-- per-screen output size, frame padding, swatch count, image fit, and Samsung device fields
-- imported Spotify albums stored locally with cached cover art and extracted palettes
-- web UI actions for render, dry-run send, and confirmed send flows
+Tests use a dedicated SQLite database and fixture images generated via Sharp. Each run gets a unique timestamped DB path so stale Windows file locks never block the suite.
 
 ## Notes
 
-- The dev UI persists project changes to SQLite and also keeps a browser fallback copy.
-- Imported cover art is stored under `assets/covers/imported/`.
-- If you share this project later, do not share your current Spotify secret as-is. Rotate it first.
+- Project state is persisted to SQLite. `data/project.json` is a seed/example only.
+- Imported cover art is cached under `assets/covers/imported/`.
+- Edit recipes are non-destructive: the original image is never modified. Derived outputs are cached at `output/.edit-cache/`.
+- The schedule runner polls every 30 seconds. It tracks `lastRunKey` per schedule to avoid duplicate runs within the same time window.
+- Do not commit `.env` or share Spotify credentials. Rotate secrets before sharing the project.
