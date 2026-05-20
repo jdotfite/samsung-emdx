@@ -1,8 +1,8 @@
-import { apiDeleteJson, apiGetJson, apiPostJson, apiPutJson, apiUploadImage } from "./api.js";
+import { apiDeleteJson, apiGetJson, apiPostJson, apiPutJson, apiUploadImage, saveApiAuthToken } from "./api.js";
 import { DEFAULT_PROJECT } from "./default-project.js";
 import { getStudioPluginById, STUDIO_PLUGINS } from "./plugin-registry.js";
 import { getTemplateById, TEMPLATE_REGISTRY } from "./template-registry.js";
-import { normalizeMusicAlbum } from "./template-utils.js";
+import { escapeHtml, normalizeMusicAlbum } from "./template-utils.js";
 
 const STORAGE_KEY = "poster-wall-project-v3";
 const UI_STORAGE_KEY = "poster-wall-ui-v1";
@@ -92,15 +92,57 @@ const state = {
       selectedSlugs: [],
       recentImportedSlugs: [],
       templateId: "music-editorial-v1",
-      generatedImageNames: []
+      generatedImageNames: [],
+      quickMode: false,
+      quickQuery: "",
+      quickRun: null
     }
   }
 };
 
 init().catch((error) => {
-  app.innerHTML = `<pre style="padding:40px;font:16px/1.5 'IBM Plex Mono', monospace;">${error.message}</pre>`;
+  if (error.status === 401) {
+    renderAuthPrompt();
+  } else {
+    app.innerHTML = `<pre style="padding:40px;font:16px/1.5 'IBM Plex Mono', monospace;">${escapeHtml(error.message)}</pre>`;
+  }
   console.error(error);
 });
+
+function renderAuthPrompt() {
+  app.innerHTML = `
+    <main class="auth-shell">
+      <section class="modal-shell" style="max-width:520px;margin:15vh auto;">
+        <div class="modal-header"><h1>Authentication required</h1></div>
+        <div class="modal-body modal-body--settings">
+          <p>Enter the app token configured with <code>APP_AUTH_TOKEN</code>.</p>
+          <label>
+            App token
+            <input id="app-auth-token" type="password" autocomplete="current-password" autofocus />
+          </label>
+        </div>
+        <div class="modal-footer">
+          <button type="button" id="save-app-auth-token">Connect</button>
+        </div>
+      </section>
+    </main>`;
+  document.getElementById("save-app-auth-token")?.addEventListener("click", () => {
+    const token = document.getElementById("app-auth-token")?.value?.trim() || "";
+    if (!token) {
+      return;
+    }
+    saveApiAuthToken(token);
+    window.location.reload();
+  });
+}
+
+function safeText(value) {
+  return escapeHtml(value ?? "");
+}
+
+function safeAttr(value) {
+  return escapeHtml(value ?? "");
+}
 
 async function init() {
   const [catalog, project, deviceState, outputPayload, spotifySettings, contentSchedules] = await Promise.all([
@@ -654,20 +696,24 @@ function stopSendFlowPolling() {
 function createPendingSendFlow({ imageName, targetNames }) {
   return {
     active: true,
+    minimized: false,
     jobId: "",
     imageName,
     targetNames,
     status: "starting",
     stage: "queued",
     error: "",
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
     targets: [],
     progress: 4,
     steps: [
       { title: "Preparing", detail: "Validating image and waking displays.", icon: "wake", state: "active" },
       { title: "Connecting", detail: "Establishing MDC connection to frame.", icon: "connect", state: "pending" },
       { title: "Commanding", detail: "Setting the content download URL.", icon: "command", state: "pending" },
-      { title: "Fetching", detail: "Frame is downloading content.json and image.", icon: "download", state: "pending" },
-      { title: "Delivered", detail: "Image received by all target frames.", icon: "check", state: "pending" }
+      { title: "Fetching", detail: "Frame is requesting content.json and the image.", icon: "download", state: "pending" },
+      { title: "Received by Frame", detail: "All target frames requested the image from this app.", icon: "check", state: "pending" },
+      { title: "Panel Refresh", detail: "Visual panel refresh is estimated after receipt and cannot be directly verified.", icon: "panel", state: "pending", estimated: true }
     ]
   };
 }
@@ -680,33 +726,45 @@ function computeSendFlowStepState(job) {
 
   const prepared = job.status !== "queued";
   const woke = any((target) => target.milestones?.wakeSent);
+  const connected = any((target) => target.milestones?.connected);
   const contentSet = any((target) => target.milestones?.contentSet);
   const contentFetched = any((target) => target.milestones?.contentJsonFetched);
   const imageFetched = all((target) => target.milestones?.imageFetched);
+  const estimatedRefresh = !failed && imageFetched;
 
   const steps = [
     { title: "Preparing", detail: "Validating image and waking displays.", icon: "wake" },
     { title: "Connecting", detail: "Establishing MDC connection to frame.", icon: "connect" },
     { title: "Commanding", detail: "Setting the content download URL.", icon: "command" },
-    { title: "Fetching", detail: "Frame is downloading content.json and image.", icon: "download" },
-    { title: "Delivered", detail: "Image received by all target frames.", icon: "check" }
+    { title: "Fetching", detail: "Frame is requesting content.json and the image.", icon: "download" },
+    { title: "Received by Frame", detail: "All target frames requested the image from this app.", icon: "check" },
+    { title: "Panel Refresh", detail: "Visual panel refresh is estimated after receipt and cannot be directly verified.", icon: "panel", estimated: true }
   ];
 
-  const completion = [prepared && (woke || !targets.some((target) => target.host)), contentSet, contentFetched, contentFetched && any((target) => target.milestones?.imageFetched), imageFetched];
+  const completion = [
+    prepared && (woke || !targets.some((target) => target.host)),
+    connected,
+    contentSet,
+    contentFetched,
+    imageFetched
+  ];
   const firstIncomplete = completion.findIndex((value) => !value);
 
   return steps.map((step, index) => {
+    if (estimatedRefresh && index < 5) {
+      return { ...step, state: "complete" };
+    }
+    if (estimatedRefresh && index === 5) {
+      return { ...step, state: "active" };
+    }
     if (failed && index === (firstIncomplete === -1 ? 0 : firstIncomplete)) {
       return { ...step, state: "error" };
     }
-    if (completion[index]) {
+    if (index < completion.length && completion[index]) {
       return { ...step, state: "complete" };
     }
-    if (job.status === "completed" && index <= 4) {
-      return { ...step, state: "complete" };
-    }
-    if (failed && index === steps.length - 1 && targets.some((t) => t.status === "unverified")) {
-      return { ...step, title: "Unverified", detail: "Frame did not confirm receipt.", state: "error" };
+    if (failed && index === 4 && targets.some((t) => t.status === "unverified")) {
+      return { ...step, title: "Unverified", detail: "One or more frames never confirmed the image fetch.", state: "error" };
     }
     return { ...step, state: index === (firstIncomplete === -1 ? 0 : firstIncomplete) ? "active" : "pending" };
   });
@@ -738,16 +796,112 @@ function syncSendFlowFromJob(job) {
   state.ui.sendFlow = {
     ...flow,
     active: true,
+    minimized: Boolean(flow.minimized),
     jobId: job.id,
     imageName: job.imageName,
     targetNames: job.targets.map((target) => target.name),
     status: job.status,
     stage: job.stage,
     error: job.error || "",
+    createdAt: job.createdAt || flow.createdAt || new Date().toISOString(),
+    updatedAt: job.updatedAt || new Date().toISOString(),
     targets: job.targets,
     progress: computeSendFlowProgress(job),
     steps: computeSendFlowStepState(job)
   };
+}
+
+function formatDurationCompact(ms) {
+  const safeMs = Number.isFinite(ms) ? Math.max(0, Math.round(ms)) : 0;
+  const totalSeconds = Math.round(safeMs / 1000);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  if (hours) {
+    return `${hours}h ${minutes}m`;
+  }
+  if (minutes) {
+    return `${minutes}m ${seconds}s`;
+  }
+  return `${seconds}s`;
+}
+
+function describeSendFlowEvent(event) {
+  const explicit = String(event?.message || "").trim();
+  if (explicit) {
+    return explicit;
+  }
+  switch (event?.type) {
+    case "wake_sent":
+      return "Wake packet sent";
+    case "wake_ready":
+    case "wake_probe_success":
+      return "Frame responded after wake";
+    case "connecting_start":
+      return "Connecting to frame";
+    case "connected":
+      return "MDC connection established";
+    case "content_set":
+      return "Content URL sent";
+    case "content_json_requested":
+    case "content_json_served":
+      return "Manifest requested";
+    case "image_requested":
+    case "image_served":
+      return "Image requested by frame";
+    case "attempt_retry":
+      return "Retrying send";
+    case "failed":
+      return "Send failed";
+    case "unverified":
+      return "Frame did not confirm receipt";
+    default:
+      return String(event?.type || "Waiting for device response").replace(/_/g, " ");
+  }
+}
+
+function getLatestSendFlowEvent(targets = []) {
+  let latest = null;
+  for (const target of targets) {
+    for (const event of target.events || []) {
+      const stamp = Date.parse(event.at || "");
+      if (!Number.isFinite(stamp)) {
+        continue;
+      }
+      if (!latest || stamp > latest.stamp) {
+        latest = {
+          stamp,
+          at: event.at,
+          targetName: target.name,
+          label: describeSendFlowEvent(event)
+        };
+      }
+    }
+  }
+  return latest;
+}
+
+function getSendFlowReceiptEvent(targets = []) {
+  let latest = null;
+  for (const target of targets) {
+    for (const event of target.events || []) {
+      if (event.type !== "image_requested" && event.type !== "image_served") {
+        continue;
+      }
+      const stamp = Date.parse(event.at || "");
+      if (!Number.isFinite(stamp)) {
+        continue;
+      }
+      if (!latest || stamp > latest.stamp) {
+        latest = {
+          stamp,
+          at: event.at,
+          targetName: target.name
+        };
+      }
+    }
+  }
+  return latest;
 }
 
 async function pollSendFlowJob(jobId, { immediate = false } = {}) {
@@ -886,7 +1040,7 @@ function normalizeEditRecipe(input) {
   const fit = EDIT_FIT_MODES.has(input.fit) ? input.fit : EDIT_RECIPE_DEFAULTS.fit;
   const cropAnchor = EDIT_CROP_ANCHORS.has(input.cropAnchor) ? input.cropAnchor : EDIT_RECIPE_DEFAULTS.cropAnchor;
   const rotate = EDIT_ROTATIONS.has(Number(input.rotate)) ? Number(input.rotate) : EDIT_RECIPE_DEFAULTS.rotate;
-  const zoom = clampNumber(Number(input.zoom), 1, 3) ?? EDIT_RECIPE_DEFAULTS.zoom;
+  const zoom = clampNumber(Number(input.zoom), 1, 5) ?? EDIT_RECIPE_DEFAULTS.zoom;
   const panX = clampNumber(Number(input.panX), -1, 1) ?? EDIT_RECIPE_DEFAULTS.panX;
   const panY = clampNumber(Number(input.panY), -1, 1) ?? EDIT_RECIPE_DEFAULTS.panY;
   const grayscale = Boolean(input.grayscale);
@@ -1784,7 +1938,7 @@ function getWallNameOptions(roomName = "") {
 }
 
 function createOptionsMarkup(options) {
-  return options.map((option) => `<option value="${option}"></option>`).join("");
+  return options.map((option) => `<option value="${safeAttr(option)}"></option>`).join("");
 }
 
 function pushToast(message, tone = "notice") {
@@ -1851,9 +2005,9 @@ function createToastLayer() {
       ${state.ui.toasts
         .map(
           (toast) => `
-            <div class="toast toast--${toast.tone}" role="${toast.tone === "error" ? "alert" : "status"}">
-              <span>${toast.message}</span>
-              <button type="button" class="toast-dismiss" data-action="dismiss-toast" data-toast-id="${toast.id}" aria-label="Dismiss message">
+            <div class="toast toast--${safeAttr(toast.tone)}" role="${toast.tone === "error" ? "alert" : "status"}">
+              <span>${safeText(toast.message)}</span>
+              <button type="button" class="toast-dismiss" data-action="dismiss-toast" data-toast-id="${safeAttr(toast.id)}" aria-label="Dismiss message">
                 ${iconSvg("close")}
               </button>
             </div>
@@ -2022,12 +2176,22 @@ function iconSvg(type) {
 function createScreenForm(screen) {
   const roomOptions = getRoomNameOptions();
   const wallOptions = getWallNameOptions(screen.roomName);
+  const screenId = safeAttr(screen.id);
+  const screenName = safeText(screen.name);
+  const screenNameAttr = safeAttr(screen.name);
+  const deviceHost = safeText(screen.device.host || "No host configured");
+  const deviceHostAttr = safeAttr(screen.device.host || "");
+  const roomNameAttr = safeAttr(screen.roomName || "");
+  const wallNameAttr = safeAttr(screen.wallName || "");
+  const pinAttr = safeAttr(screen.device.pin || "");
+  const macAttr = safeAttr(screen.device.mac || "");
+  const localIpAttr = safeAttr(screen.device.localIp || "");
   return `
-    <section class="screen-form screen-form--modal" data-screen-id="${screen.id}">
+    <section class="screen-form screen-form--modal" data-screen-id="${screenId}">
       <div class="screen-card-header">
         <div class="screen-card-title">
-          <h3>${screen.name}</h3>
-          <p>${screen.device.host || "No host configured"}</p>
+          <h3>${screenName}</h3>
+          <p>${deviceHost}</p>
         </div>
       </div>
       <div class="screen-card-tools">
@@ -2036,30 +2200,30 @@ function createScreenForm(screen) {
             <input type="checkbox" data-path="enabled" ${screen.enabled ? "checked" : ""} />
             Available for sends
           </label>
-          <button type="button" class="secondary" data-action="duplicate-screen" data-screen-id="${screen.id}">Duplicate</button>
-          <button type="button" class="secondary" data-action="remove-screen" data-screen-id="${screen.id}">Remove</button>
+          <button type="button" class="secondary" data-action="duplicate-screen" data-screen-id="${screenId}">Duplicate</button>
+          <button type="button" class="secondary" data-action="remove-screen" data-screen-id="${screenId}">Remove</button>
         </div>
       </div>
 
       <div class="field-row">
         <label>
           Device Name
-          <input type="text" data-path="name" value="${screen.name}" />
+          <input type="text" data-path="name" value="${screenNameAttr}" />
         </label>
         <label>
           Device Host
-          <input type="text" data-path="device.host" value="${screen.device.host}" />
+          <input type="text" data-path="device.host" value="${deviceHostAttr}" />
         </label>
       </div>
 
       <div class="field-row field-row--three">
         <label>
           Room
-          <input type="text" data-path="roomName" value="${screen.roomName || ""}" placeholder="Office" list="room-name-options" />
+          <input type="text" data-path="roomName" value="${roomNameAttr}" placeholder="Office" list="room-name-options" />
         </label>
         <label>
           Wall
-          <input type="text" data-path="wallName" value="${screen.wallName || ""}" placeholder="Poster Wall" list="wall-name-options" />
+          <input type="text" data-path="wallName" value="${wallNameAttr}" placeholder="Poster Wall" list="wall-name-options" />
         </label>
         <label>
           Wall Slot
@@ -2077,15 +2241,15 @@ function createScreenForm(screen) {
       <div class="field-row field-row--three">
         <label>
           Device PIN
-          <input type="text" data-path="device.pin" value="${screen.device.pin}" />
+          <input type="text" data-path="device.pin" value="${pinAttr}" />
         </label>
         <label>
           Device MAC
-          <input type="text" data-path="device.mac" value="${screen.device.mac}" />
+          <input type="text" data-path="device.mac" value="${macAttr}" />
         </label>
         <label>
           Local IP
-          <input type="text" data-path="device.localIp" value="${screen.device.localIp || ""}" />
+          <input type="text" data-path="device.localIp" value="${localIpAttr}" />
         </label>
       </div>
     </section>
@@ -2098,24 +2262,32 @@ function createPreviewCard(screen) {
   const screenIndex = state.project.screens.findIndex((entry) => entry.id === screen.id);
   const isFirst = screenIndex <= 0;
   const isLast = screenIndex === state.project.screens.length - 1;
+  const screenId = safeAttr(screen.id);
+  const screenName = safeText(screen.name);
+  const screenNameAttr = safeAttr(screen.name);
+  const statusTone = safeAttr(status.tone);
+  const statusLabel = safeText(status.label);
+  const deviceMeta = safeText(getDeviceCardMeta(screen.id));
+  const previewUrl = preview ? safeAttr(preview.url) : "";
+  const previewLabel = preview ? safeText(preview.label) : "";
 
   return `
     <article class="preview-card device-card">
       <div class="preview-card-header">
         <div>
           <div class="device-card-title-row">
-            <h3>${screen.name}</h3>
-            <span class="device-status-chip ${status.tone}">${status.label}</span>
+            <h3>${screenName}</h3>
+            <span class="device-status-chip ${statusTone}">${statusLabel}</span>
           </div>
-          <p>${screen.wallSlot ? `${wallSlotLabel(screen.wallSlot)} slot` : "Unassigned slot"} · ${getDeviceCardMeta(screen.id)}</p>
+          <p>${screen.wallSlot ? `${wallSlotLabel(screen.wallSlot)} slot` : "Unassigned slot"} · ${deviceMeta}</p>
         </div>
         <div class="preview-head-tools">
           <button
             type="button"
             class="icon-button icon-button--ghost icon-button--small"
             data-action="check-device-status"
-            data-screen-id="${screen.id}"
-            aria-label="Refresh status for ${screen.name}"
+            data-screen-id="${screenId}"
+            aria-label="Refresh status for ${screenNameAttr}"
             title="Refresh status"
           >
             ${iconSvg("refresh")}
@@ -2124,8 +2296,8 @@ function createPreviewCard(screen) {
             type="button"
             class="icon-button icon-button--ghost icon-button--small"
             data-action="move-screen-up"
-            data-screen-id="${screen.id}"
-            aria-label="Move ${screen.name} earlier"
+            data-screen-id="${screenId}"
+            aria-label="Move ${screenNameAttr} earlier"
             title="Move earlier"
             ${isFirst ? "disabled" : ""}
           >
@@ -2135,8 +2307,8 @@ function createPreviewCard(screen) {
             type="button"
             class="icon-button icon-button--ghost icon-button--small"
             data-action="move-screen-down"
-            data-screen-id="${screen.id}"
-            aria-label="Move ${screen.name} later"
+            data-screen-id="${screenId}"
+            aria-label="Move ${screenNameAttr} later"
             title="Move later"
             ${isLast ? "disabled" : ""}
           >
@@ -2146,9 +2318,9 @@ function createPreviewCard(screen) {
             type="button"
             class="icon-button icon-button--ghost"
             data-action="open-screen-modal"
-            data-screen-id="${screen.id}"
-            aria-label="Edit ${screen.name}"
-            title="Edit ${screen.name}"
+            data-screen-id="${screenId}"
+            aria-label="Edit ${screenNameAttr}"
+            title="Edit ${screenNameAttr}"
           >
             ${iconSvg("controls")}
           </button>
@@ -2157,13 +2329,13 @@ function createPreviewCard(screen) {
       <div class="device-preview">
         ${
           preview
-            ? `<img class="device-preview-image" src="${preview.url}" alt="Last image sent to ${screen.name}" />
-               <span class="device-preview-label">${preview.label}</span>`
+            ? `<img class="device-preview-image" src="${previewUrl}" alt="Last image sent to ${screenNameAttr}" />
+               <span class="device-preview-label">${previewLabel}</span>`
             : `<div class="device-preview-placeholder">No image sent from this app yet.</div>`
         }
       </div>
       <div class="device-card-footer">
-        <button type="button" class="device-content-button" data-action="open-content" data-screen-id="${screen.id}">
+        <button type="button" class="device-content-button" data-action="open-content" data-screen-id="${screenId}">
           Change Content
         </button>
       </div>
@@ -2201,6 +2373,25 @@ function getContentEditCropMode(editState) {
   return isManualCropDraft(editState?.draft) ? "manual" : "preset";
 }
 
+function getContentEditCropModeLabel(editState) {
+  return getContentEditCropMode(editState) === "manual" ? "Manual crop" : "Quick fit";
+}
+
+function getEditCropAnchorBias(anchor) {
+  switch (anchor) {
+    case "top":
+      return { x: 0.5, y: 0 };
+    case "bottom":
+      return { x: 0.5, y: 1 };
+    case "left":
+      return { x: 0, y: 0.5 };
+    case "right":
+      return { x: 1, y: 0.5 };
+    default:
+      return { x: 0.5, y: 0.5 };
+  }
+}
+
 function createContentMetaChips(labels, extraClass = "") {
   const normalized = labels
     .map((label) => String(label || "").trim())
@@ -2210,7 +2401,7 @@ function createContentMetaChips(labels, extraClass = "") {
   }
   return `
     <div class="content-meta-row${extraClass ? ` ${extraClass}` : ""}">
-      ${normalized.map((label) => `<span class="content-meta-chip">${label}</span>`).join("")}
+      ${normalized.map((label) => `<span class="content-meta-chip">${safeText(label)}</span>`).join("")}
     </div>
   `;
 }
@@ -2237,15 +2428,17 @@ function createOutputImageCard(image) {
   const isSelected = isManageMode
     ? state.ui.contentManageSelections.includes(image.name)
     : state.ui.contentSelectedImage === image.name;
+  const imageName = safeText(image.name);
+  const imageNameAttr = safeAttr(image.name);
   const fitCheck = evaluateImageFit(image, getFitCheckTargetScreens());
   const fitChip = fitCheck.status.startsWith("warn")
-    ? `<span class="content-meta-chip content-meta-chip--warn" title="${fitCheck.title}">${fitCheck.label}</span>`
+    ? `<span class="content-meta-chip content-meta-chip--warn" title="${safeAttr(fitCheck.title)}">${safeText(fitCheck.label)}</span>`
     : "";
   const badges = [
     fitChip,
-    ...image.collectionNames.map((name) => `<span class="content-meta-chip">${name}</span>`),
+    ...image.collectionNames.map((name) => `<span class="content-meta-chip">${safeText(name)}</span>`),
     image.setMembership
-      ? `<span class="content-meta-chip content-meta-chip--set">${image.setMembership.setName} ${image.setMembership.position}/${image.setMembership.count}</span>`
+      ? `<span class="content-meta-chip content-meta-chip--set">${safeText(image.setMembership.setName)} ${safeText(image.setMembership.position)}/${safeText(image.setMembership.count)}</span>`
       : "",
     image.editRecipe ? `<span class="content-meta-chip content-meta-chip--edited">Edited</span>` : "",
     image.favorite ? `<span class="content-meta-chip content-meta-chip--favorite">★</span>` : ""
@@ -2257,11 +2450,10 @@ function createOutputImageCard(image) {
   const previewImageUrl = image.editRecipe
     ? buildSavedContentPreviewUrl(image)
     : `${image.url}?t=${encodeURIComponent(image.modifiedAt)}`;
-  const previewAction = isManageMode ? "select-content-image" : "open-content-preview";
   return `
     <article
       class="output-card ${isSelected ? "is-selected" : ""} ${isManageMode ? "is-manage-mode" : ""}"
-      data-image-name="${image.name}"
+      data-image-name="${imageNameAttr}"
     >
       ${
         !isManageMode
@@ -2271,8 +2463,8 @@ function createOutputImageCard(image) {
                 type="button"
                 class="icon-button icon-button--ghost icon-button--small ${image.favorite ? "is-favorite" : ""}"
                 data-action="toggle-content-favorite"
-                data-image-name="${image.name}"
-                aria-label="${image.favorite ? "Unfavorite" : "Favorite"} ${image.name}"
+                data-image-name="${imageNameAttr}"
+                aria-label="${image.favorite ? "Unfavorite" : "Favorite"} ${imageNameAttr}"
                 title="${image.favorite ? "Unfavorite" : "Favorite"}"
               >
                 ${image.favorite ? "★" : "☆"}
@@ -2281,8 +2473,8 @@ function createOutputImageCard(image) {
                 type="button"
                 class="icon-button icon-button--ghost icon-button--small"
                 data-action="open-content-edit"
-                data-image-name="${image.name}"
-                aria-label="Edit ${image.name}"
+                data-image-name="${imageNameAttr}"
+                aria-label="Edit ${imageNameAttr}"
                 title="Edit image"
               >
                 ${iconSvg("edit")}
@@ -2291,8 +2483,8 @@ function createOutputImageCard(image) {
                 type="button"
                 class="icon-button icon-button--ghost icon-button--small"
                 data-action="open-content-preview"
-                data-image-name="${image.name}"
-                aria-label="Preview ${image.name}"
+                data-image-name="${imageNameAttr}"
+                aria-label="Preview ${imageNameAttr}"
                 title="Preview image"
               >
                 ${iconSvg("zoom")}
@@ -2304,21 +2496,21 @@ function createOutputImageCard(image) {
       <button
         type="button"
         class="output-card-preview"
-        data-action="${previewAction}"
-        data-image-name="${image.name}"
-        aria-label="${isManageMode ? `Select ${image.name}` : `Preview ${image.name}`}"
+        data-action="select-content-image"
+        data-image-name="${imageNameAttr}"
+        aria-label="Select ${imageNameAttr}"
       >
         ${isManageMode ? `<span class="output-card-select ${isSelected ? "is-selected" : ""}"></span>` : ""}
-        <img src="${previewImageUrl}" alt="${image.name}" />
+        <img src="${safeAttr(previewImageUrl)}" alt="${imageNameAttr}" />
       </button>
       <button
         type="button"
         class="output-card-copy"
         data-action="select-content-image"
-        data-image-name="${image.name}"
+        data-image-name="${imageNameAttr}"
       >
-        <strong>${image.name}</strong>
-        <span>${metaLine}</span>
+        <strong>${imageName}</strong>
+        <span>${safeText(metaLine)}</span>
         ${badges.length ? `<div class="content-meta-row">${badges.join("")}</div>` : ""}
       </button>
     </article>
@@ -2327,55 +2519,63 @@ function createOutputImageCard(image) {
 
 function createContentBrowseCollectionsPanel() {
   const summary = getContentCollectionSummaries();
-  if (!summary.collections.length) {
-    return `
-      <section class="content-library-panel content-library-panel--browse">
-        <div class="content-library-copy">
-          <span class="device-summary-kicker">Collections</span>
-          <strong>Browse all posters</strong>
-          <span>When you are ready to organize themes like movie posters or US locations, use Manage Library to create collections.</span>
-        </div>
-      </section>
-    `;
-  }
-
-  const collectionCards = summary.collections.map((collection) => {
-    const isSelected = state.ui.contentLibraryFilter === `collection:${collection.id}`;
-    return `
+  const activeCollection = getActiveContentCollection();
+  const scheduleCount = state.contentSchedules.length;
+  const setCount = getContentLibrary().sets.length;
+  const totalCount = summary.total;
+  const visibleCount = getVisibleOutputImages().length;
+  const collectionChips = [
+    `
       <button
         type="button"
-        class="content-collection-card ${isSelected ? "is-selected" : ""}"
+        class="content-filter-chip ${state.ui.contentLibraryFilter === "all" ? "is-selected" : ""}"
         data-action="filter-content-library"
-        data-filter="collection:${collection.id}"
+        data-filter="all"
       >
-        <span class="device-summary-kicker">Collection</span>
-        <strong>${collection.name}</strong>
-        <span>${collection.count} image${collection.count === 1 ? "" : "s"}</span>
+        <strong>All Posters</strong>
+        <span>${summary.total} image${summary.total === 1 ? "" : "s"}</span>
       </button>
-    `;
-  }).join("");
-
-  return `
-    <section class="content-library-panel content-library-panel--browse">
-      <div class="content-library-row content-library-row--browse">
-        <div class="content-library-copy">
-          <span class="device-summary-kicker">Collections</span>
-          <strong>${summary.collections.length} collection${summary.collections.length === 1 ? "" : "s"} ready</strong>
-          <span>Open a collection to browse a theme quickly. Use Manage Library only when you want to organize posters.</span>
-        </div>
-      </div>
-      <div class="content-collection-grid">
+    `,
+    ...summary.collections.map((collection) => {
+      const isSelected = state.ui.contentLibraryFilter === `collection:${collection.id}`;
+      const collectionId = safeAttr(collection.id);
+      const collectionName = safeText(collection.name);
+      return `
         <button
           type="button"
-          class="content-collection-card ${state.ui.contentLibraryFilter === "all" ? "is-selected" : ""}"
+          class="content-filter-chip ${isSelected ? "is-selected" : ""}"
           data-action="filter-content-library"
-          data-filter="all"
+          data-filter="collection:${collectionId}"
         >
-          <span class="device-summary-kicker">Library</span>
-          <strong>All Posters</strong>
-          <span>${summary.total} image${summary.total === 1 ? "" : "s"}</span>
+          <strong>${collectionName}</strong>
+          <span>${collection.count} image${collection.count === 1 ? "" : "s"}</span>
         </button>
-        ${collectionCards}
+      `;
+    })
+  ].join("");
+  const focusTitle = activeCollection ? activeCollection.name : "All Posters";
+  const focusCopy = activeCollection
+    ? `${visibleCount} image${visibleCount === 1 ? "" : "s"} in this collection. Pick one to preview, send, or schedule.`
+    : `${totalCount} poster${totalCount === 1 ? "" : "s"} ready. Pick a poster first, then preview it, send it, or schedule it.`;
+  return `
+    <section class="content-library-panel content-library-panel--browse content-library-panel--browse-summary">
+      <div class="content-library-row content-library-row--browse-summary">
+        <div class="content-library-copy">
+          <span class="device-summary-kicker">Poster Library</span>
+          <strong>${safeText(focusTitle)}</strong>
+          <span>${safeText(focusCopy)}</span>
+        </div>
+        <div class="content-browse-summary-actions">
+          ${activeCollection ? `<button type="button" class="secondary" data-action="filter-content-library" data-filter="all">View All Posters</button>` : ""}
+          <button type="button" class="secondary" data-action="open-content-manage">Manage Wall Layouts${setCount ? `<span class="content-action-badge" aria-hidden="true">${setCount}</span>` : ""}</button>
+          <button type="button" class="secondary" data-action="open-content-automation">Manage Schedules${scheduleCount ? `<span class="content-action-badge" aria-hidden="true">${scheduleCount}</span>` : ""}</button>
+        </div>
+      </div>
+      <div class="content-browse-collection-strip">
+        <span class="content-browse-strip-label">Collections</span>
+        <div class="content-filter-row content-filter-row--browse">
+          ${collectionChips}
+        </div>
       </div>
     </section>
   `;
@@ -2400,28 +2600,11 @@ function createContentSetsPanel({ showEmpty = false } = {}) {
   `;
 }
 
-function createContentBrowseLayoutHintPanel() {
-  const setCount = getContentLibrary().sets.length;
-  if (!setCount) {
-    return "";
-  }
-  return `
-    <section class="content-scope-panel content-scope-panel--layouts">
-      <div class="content-library-copy">
-        <span class="device-summary-kicker">Wall Layouts</span>
-        <strong>${setCount} ordered set${setCount === 1 ? "" : "s"} in your library</strong>
-        <span>Triptychs and other grouped wall layouts are managed in Manage Library so normal browsing stays focused on single-poster preview and send.</span>
-      </div>
-      <div class="content-scope-actions">
-        <button type="button" class="secondary" data-action="open-content-manage">Manage Wall Layouts</button>
-      </div>
-    </section>
-  `;
-}
-
 function createContentSetCard(set) {
   const positions = [...(set.items || [])].sort((a, b) => a.position - b.position);
   const { wallContext, mappings, issues, canSend } = getContentSetMappings(set, { enabledOnly: true });
+  const setId = safeAttr(set.id);
+  const setName = safeText(set.name);
   const imagesByName = new Map(getEnrichedOutputImages().map((image) => [image.name, image]));
   const thumbs = mappings.map((mapping) => {
     const image = imagesByName.get(mapping.item.imageName);
@@ -2431,13 +2614,13 @@ function createContentSetCard(set) {
     return `
       <div class="content-set-thumb">
         <div class="content-set-thumb-image">
-          ${src ? `<img src="${src}" alt="${mapping.item.imageName}" />` : `<span class="content-set-thumb-missing">Missing</span>`}
-          <span class="content-set-position-badge">${slotLabel}</span>
+          ${src ? `<img src="${safeAttr(src)}" alt="${safeAttr(mapping.item.imageName)}" />` : `<span class="content-set-thumb-missing">Missing</span>`}
+          <span class="content-set-position-badge">${safeText(slotLabel)}</span>
         </div>
         <div class="content-set-thumb-meta">
-          <strong>${mapping.item.imageName}</strong>
-          <span>${slotLabel} → ${mapLabel}</span>
-          ${image ? `<span class="content-set-thumb-facts">${getContentAssetFactLabels(image, { includeSize: false }).join(" · ")}</span>` : ""}
+          <strong>${safeText(mapping.item.imageName)}</strong>
+          <span>${safeText(slotLabel)} → ${safeText(mapLabel)}</span>
+          ${image ? `<span class="content-set-thumb-facts">${safeText(getContentAssetFactLabels(image, { includeSize: false }).join(" · "))}</span>` : ""}
         </div>
       </div>
     `;
@@ -2447,32 +2630,32 @@ function createContentSetCard(set) {
     ? `Send ${set.name} to ${wallLabel}`
     : issues[0] || "Finish the wall mapping before sending this set.";
   return `
-    <article class="content-set-card" data-set-id="${set.id}">
+    <article class="content-set-card" data-set-id="${setId}">
       <header class="content-set-card-header">
         <div class="content-set-card-copy">
-          <strong>${set.name}</strong>
-          <span>${positions.length} panel${positions.length === 1 ? "" : "s"} · ${wallLabel}</span>
+          <strong>${setName}</strong>
+          <span>${positions.length} panel${positions.length === 1 ? "" : "s"} · ${safeText(wallLabel)}</span>
         </div>
         <div class="content-set-card-tools">
           <button
             type="button"
             class="icon-button icon-button--ghost icon-button--small"
             data-action="open-content-set-editor"
-            data-set-id="${set.id}"
+            data-set-id="${setId}"
             aria-label="Edit set layout"
             title="Edit layout"
           >
             ${iconSvg("controls")}
           </button>
-          <button type="button" class="icon-button icon-button--ghost icon-button--small" data-action="delete-content-set" data-set-id="${set.id}" aria-label="Delete set">×</button>
+          <button type="button" class="icon-button icon-button--ghost icon-button--small" data-action="delete-content-set" data-set-id="${setId}" aria-label="Delete set">×</button>
         </div>
       </header>
-      ${issues.length ? `<p class="content-set-card-warning">${issues[0]}</p>` : ""}
+      ${issues.length ? `<p class="content-set-card-warning">${safeText(issues[0])}</p>` : ""}
       <div class="content-set-card-thumbs">${thumbs}</div>
       <footer class="content-set-card-footer">
-        <button type="button" class="secondary" data-action="open-content-set-editor" data-set-id="${set.id}">Edit Layout</button>
-        <button type="button" class="secondary" data-action="open-content-set-schedule" data-set-id="${set.id}" ${canSend ? "" : "disabled"} title="${sendTitle}">Schedule</button>
-        <button type="button" data-action="send-content-set" data-set-id="${set.id}" ${canSend ? "" : "disabled"} title="${sendTitle}">Send to Wall</button>
+        <button type="button" class="secondary" data-action="open-content-set-editor" data-set-id="${setId}">Edit Layout</button>
+        <button type="button" class="secondary" data-action="open-content-set-schedule" data-set-id="${setId}" ${canSend ? "" : "disabled"} title="${safeAttr(sendTitle)}">Schedule</button>
+        <button type="button" data-action="send-content-set" data-set-id="${setId}" ${canSend ? "" : "disabled"} title="${safeAttr(sendTitle)}">Send to Wall</button>
       </footer>
     </article>
   `;
@@ -2489,13 +2672,16 @@ function createContentSetEditorModal() {
   const imagesByName = new Map(getEnrichedOutputImages().map((image) => [image.name, image]));
   const enabledWallCount = wallContext ? getWallScreensBySlot(wallContext.wall.id, { enabledOnly: true }).length : 0;
   const wallWarnings = wallContext ? getWallSlotWarnings(getWallSlotOccupancy(wallContext.wall)) : [];
+  const setIdAttr = safeAttr(set.id);
+  const setName = safeText(set.name);
+  const setNameAttr = safeAttr(set.name);
   return `
     <div class="modal-backdrop" data-action="close-content-set-editor"></div>
     <section class="modal-shell modal-shell--set-editor" role="dialog" aria-modal="true" aria-label="Edit ordered set">
       <div class="modal-header">
         <div>
           <p class="modal-kicker">Ordered Set</p>
-          <h2>${set.name}</h2>
+          <h2>${setName}</h2>
           <p class="send-flow-copy">Assign this layout to a wall, then map each poster to a slot before sending it.</p>
         </div>
         <button type="button" class="icon-button icon-button--ghost" data-action="close-content-set-editor" aria-label="Close set editor">
@@ -2506,15 +2692,15 @@ function createContentSetEditorModal() {
         <aside class="content-set-editor-sidebar">
           <label class="content-set-editor-field">
             <span>Set name</span>
-            <input id="content-set-editor-name" data-set-id="${set.id}" type="text" value="${set.name.replace(/"/g, "&quot;")}" />
+            <input id="content-set-editor-name" data-set-id="${setIdAttr}" type="text" value="${setNameAttr}" />
           </label>
           <label class="content-set-editor-field">
             <span>Target wall</span>
-            <select id="content-set-editor-wall" data-set-id="${set.id}">
+            <select id="content-set-editor-wall" data-set-id="${setIdAttr}">
               <option value="">Choose wall</option>
               ${wallOptions.map(({ room, wall }) => {
                 const enabledCount = getWallScreensBySlot(wall.id, { enabledOnly: true }).length;
-                return `<option value="${wall.id}" ${set.wallId === wall.id ? "selected" : ""}>${room.name} / ${wall.name} · ${enabledCount} enabled</option>`;
+                return `<option value="${safeAttr(wall.id)}" ${set.wallId === wall.id ? "selected" : ""}>${safeText(room.name)} / ${safeText(wall.name)} · ${enabledCount} enabled</option>`;
               }).join("")}
             </select>
           </label>
@@ -2528,20 +2714,20 @@ function createContentSetEditorModal() {
             ? `
               <div class="content-set-editor-note content-set-editor-note--warn">
                 <strong>Needs attention</strong>
-                <span>${issues[0]}</span>
+                <span>${safeText(issues[0])}</span>
               </div>
             `
             : `
               <div class="content-set-editor-note">
                 <strong>Ready to send</strong>
-                <span>${wallContext ? `${set.name} is mapped to ${wallContext.room.name} / ${wallContext.wall.name}.` : "Choose a wall to finish the mapping."}</span>
+                <span>${wallContext ? `${setName} is mapped to ${safeText(wallContext.room.name)} / ${safeText(wallContext.wall.name)}.` : "Choose a wall to finish the mapping."}</span>
               </div>
             `}
           ${wallWarnings.length
             ? `
               <div class="content-set-editor-note">
                 <strong>Wall notes</strong>
-                <span>${wallWarnings[0]}</span>
+                <span>${safeText(wallWarnings[0])}</span>
               </div>
             `
             : ""}
@@ -2550,20 +2736,20 @@ function createContentSetEditorModal() {
           ${mappings.map((mapping, index) => {
             const image = imagesByName.get(mapping.item.imageName);
             const previewMarkup = image
-              ? `<img src="${buildSavedContentPreviewUrl(image)}" alt="${mapping.item.imageName}" />`
+              ? `<img src="${safeAttr(buildSavedContentPreviewUrl(image))}" alt="${safeAttr(mapping.item.imageName)}" />`
               : `<span>Missing</span>`;
             return `
               <article class="content-set-editor-item">
                 <div class="content-set-editor-item-preview">${previewMarkup}</div>
                 <div class="content-set-editor-item-copy">
                   <span class="device-summary-kicker">Panel ${index + 1}</span>
-                  <strong>${mapping.item.imageName}</strong>
-                  <span>${mapping.targetScreen ? `Mapped to ${mapping.targetScreen.name}` : "No matching frame yet"}</span>
-                  ${image ? `<span class="content-set-thumb-facts">${getContentAssetFactLabels(image, { includeSize: false }).join(" · ")}</span>` : ""}
+                  <strong>${safeText(mapping.item.imageName)}</strong>
+                  <span>${mapping.targetScreen ? `Mapped to ${safeText(mapping.targetScreen.name)}` : "No matching frame yet"}</span>
+                  ${image ? `<span class="content-set-thumb-facts">${safeText(getContentAssetFactLabels(image, { includeSize: false }).join(" · "))}</span>` : ""}
                 </div>
                 <label class="content-set-editor-field">
                   <span>Slot</span>
-                  <select data-set-slot-input="true" data-set-id="${set.id}" data-image-name="${mapping.item.imageName}">
+                  <select data-set-slot-input="true" data-set-id="${setIdAttr}" data-image-name="${safeAttr(mapping.item.imageName)}">
                     <option value="">Auto</option>
                     ${["left", "center", "right"].map((slot) => `<option value="${slot}" ${mapping.item.slot === slot ? "selected" : ""}>${wallSlotLabel(slot)}</option>`).join("")}
                   </select>
@@ -2575,8 +2761,8 @@ function createContentSetEditorModal() {
       </div>
       <div class="modal-footer">
         <button type="button" class="secondary" data-action="close-content-set-editor">Close</button>
-        <button type="button" class="secondary" data-action="open-content-set-schedule" data-set-id="${set.id}" ${canSend ? "" : "disabled"}>Schedule</button>
-        <button type="button" data-action="send-content-set" data-set-id="${set.id}" ${canSend ? "" : "disabled"}>Send to Wall</button>
+        <button type="button" class="secondary" data-action="open-content-set-schedule" data-set-id="${setIdAttr}" ${canSend ? "" : "disabled"}>Schedule</button>
+        <button type="button" data-action="send-content-set" data-set-id="${setIdAttr}" ${canSend ? "" : "disabled"}>Send to Wall</button>
       </div>
     </section>
   `;
@@ -2616,22 +2802,23 @@ function createContentScheduleCard(schedule) {
   const assetFacts = scheduleImage
     ? getContentAssetFactLabels(scheduleImage, { includeSize: false }).join(" · ")
     : "";
+  const scheduleId = safeAttr(schedule.id);
   return `
-    <article class="content-schedule-card" data-schedule-id="${schedule.id}">
+    <article class="content-schedule-card" data-schedule-id="${scheduleId}">
       <header class="content-schedule-card-header">
         <div class="content-schedule-card-copy">
           <span class="device-summary-kicker">${kindLabel}</span>
-          <strong>${schedule.name}</strong>
-          <span>${target.title}</span>
-          <span>${target.detail}</span>
-          ${assetFacts ? `<span class="content-set-thumb-facts">${assetFacts}</span>` : ""}
+          <strong>${safeText(schedule.name)}</strong>
+          <span>${safeText(target.title)}</span>
+          <span>${safeText(target.detail)}</span>
+          ${assetFacts ? `<span class="content-set-thumb-facts">${safeText(assetFacts)}</span>` : ""}
         </div>
         <div class="content-set-card-tools">
           <button
             type="button"
             class="icon-button icon-button--ghost icon-button--small"
             data-action="open-content-schedule-editor"
-            data-schedule-id="${schedule.id}"
+            data-schedule-id="${scheduleId}"
             aria-label="Edit schedule"
             title="Edit schedule"
           >
@@ -2641,7 +2828,7 @@ function createContentScheduleCard(schedule) {
             type="button"
             class="icon-button icon-button--ghost icon-button--small"
             data-action="delete-content-schedule"
-            data-schedule-id="${schedule.id}"
+            data-schedule-id="${scheduleId}"
             aria-label="Delete schedule"
             title="Delete schedule"
           >
@@ -2649,12 +2836,12 @@ function createContentScheduleCard(schedule) {
           </button>
         </div>
       </header>
-      ${warning ? `<p class="content-set-card-warning">${warning}</p>` : ""}
+      ${warning ? `<p class="content-set-card-warning">${safeText(warning)}</p>` : ""}
       ${createContentMetaChips([recurrence, nextLabel, statusLabel], "content-meta-row--preview")}
-      ${schedule.lastError ? `<p class="content-schedule-card-detail">${schedule.lastError}</p>` : ""}
+      ${schedule.lastError ? `<p class="content-schedule-card-detail">${safeText(schedule.lastError)}</p>` : ""}
       <footer class="content-set-card-footer">
-        <button type="button" class="secondary" data-action="open-content-schedule-editor" data-schedule-id="${schedule.id}">Edit</button>
-        <button type="button" class="secondary" data-action="toggle-content-schedule-enabled" data-schedule-id="${schedule.id}">
+        <button type="button" class="secondary" data-action="open-content-schedule-editor" data-schedule-id="${scheduleId}">Edit</button>
+        <button type="button" class="secondary" data-action="toggle-content-schedule-enabled" data-schedule-id="${scheduleId}">
           ${schedule.enabled ? "Pause" : "Resume"}
         </button>
       </footer>
@@ -2690,26 +2877,6 @@ function createContentSchedulesPanel({ showEmpty = false } = {}) {
             ? `<div class="empty-state empty-state--compact"><div><h2>No schedules yet</h2><p>Choose a poster in browse mode or open a wall layout here, then save a time-based send.</p></div></div>`
             : ""
       }
-    </section>
-  `;
-}
-
-function createContentBrowseAutomationHintPanel() {
-  const scheduleCount = state.contentSchedules.length;
-  if (!scheduleCount) {
-    return "";
-  }
-
-  return `
-    <section class="content-scope-panel content-scope-panel--layouts">
-      <div class="content-library-copy">
-        <span class="device-summary-kicker">Automation</span>
-        <strong>${scheduleCount} scheduled send${scheduleCount === 1 ? "" : "s"} saved</strong>
-        <span>Schedules live in Manage Library so browse mode stays focused on quick preview, target selection, and send.</span>
-      </div>
-      <div class="content-scope-actions">
-        <button type="button" class="secondary" data-action="open-content-automation">Manage Schedules</button>
-      </div>
     </section>
   `;
 }
@@ -2760,11 +2927,11 @@ function createContentScheduleModal() {
         <div class="content-schedule-form">
           <label class="content-schedule-field">
             <span>Schedule name</span>
-            <input id="content-schedule-name" type="text" value="${draft.name.replace(/"/g, "&quot;")}" />
+            <input id="content-schedule-name" type="text" value="${safeAttr(draft.name)}" />
           </label>
           <div class="content-schedule-note">
-            <strong>${targetSummary.title}</strong>
-            <span>${targetSummary.detail}</span>
+            <strong>${safeText(targetSummary.title)}</strong>
+            <span>${safeText(targetSummary.detail)}</span>
           </div>
           <div class="content-schedule-field-row">
             <label class="content-schedule-field">
@@ -2777,10 +2944,10 @@ function createContentScheduleModal() {
             </label>
             <label class="content-schedule-field">
               <span>${draft.recurrence === "once" ? "Run at" : draft.recurrence === "weekly" ? "Starts on" : "Starts"}</span>
-              <input id="content-schedule-datetime" type="datetime-local" value="${draft.datetimeLocal}" />
+              <input id="content-schedule-datetime" type="datetime-local" value="${safeAttr(draft.datetimeLocal)}" />
             </label>
           </div>
-          <p class="modal-inline-note">${recurrenceCopy} Times follow ${draft.timeZone}.</p>
+          <p class="modal-inline-note">${recurrenceCopy} Times follow ${safeText(draft.timeZone)}.</p>
           <label class="toggle toggle--inline">
             <input id="content-schedule-enabled" type="checkbox" ${draft.enabled ? "checked" : ""} />
             <span>Schedule enabled</span>
@@ -2806,19 +2973,22 @@ function createContentBrowseToolbar() {
   return `
     <div class="content-library-toolbar">
       <div class="content-library-toolbar-search">
-        <input
-          id="content-library-search"
-          type="search"
-          placeholder="Search by name, tag, collection, orientation"
-          value="${query.replace(/"/g, "&quot;")}"
-          autocomplete="off"
-          spellcheck="false"
-        />
-        ${query ? `<button type="button" class="content-library-toolbar-clear" data-action="clear-content-library-search" aria-label="Clear search">×</button>` : ""}
+        <span class="content-library-toolbar-label">Search</span>
+        <div class="content-library-toolbar-search-field">
+          <input
+            id="content-library-search"
+            type="search"
+            placeholder="Search by name, tag, collection, orientation"
+            value="${query.replace(/"/g, "&quot;")}"
+            autocomplete="off"
+            spellcheck="false"
+          />
+          ${query ? `<button type="button" class="content-library-toolbar-clear" data-action="clear-content-library-search" aria-label="Clear search">×</button>` : ""}
+        </div>
       </div>
       <div class="content-library-toolbar-controls">
         <label class="content-library-toolbar-sort">
-          <span>Sort</span>
+          <span class="content-library-toolbar-label">Sort</span>
           <select id="content-library-sort">
             <option value="recent" ${sortKey === "recent" ? "selected" : ""}>Newest first</option>
             <option value="oldest" ${sortKey === "oldest" ? "selected" : ""}>Oldest first</option>
@@ -2835,26 +3005,6 @@ function createContentBrowseToolbar() {
         ${hasFilter ? `<button type="button" class="content-library-toolbar-reset" data-action="reset-content-library-filters">Reset</button>` : ""}
       </div>
     </div>
-  `;
-}
-
-function createContentCollectionScopePanel() {
-  const activeCollection = getActiveContentCollection();
-  if (!activeCollection) {
-    return "";
-  }
-  const visibleCount = getVisibleOutputImages().length;
-  return `
-    <section class="content-scope-panel">
-      <div class="content-library-copy">
-        <span class="device-summary-kicker">Collection</span>
-        <strong>${activeCollection.name}</strong>
-        <span>${visibleCount} image${visibleCount === 1 ? "" : "s"} in this collection. Browse here, then pick a poster and send it like normal.</span>
-      </div>
-      <div class="content-scope-actions">
-        <button type="button" class="secondary" data-action="filter-content-library" data-filter="all">View All Posters</button>
-      </div>
-    </section>
   `;
 }
 
@@ -2910,9 +3060,9 @@ function createContentManagePanel() {
             type="button"
             class="content-filter-chip ${state.ui.contentLibraryFilter === `collection:${collection.id}` ? "is-selected" : ""}"
             data-action="filter-content-library"
-            data-filter="collection:${collection.id}"
+            data-filter="collection:${safeAttr(collection.id)}"
           >
-            <strong>${collection.name}</strong>
+            <strong>${safeText(collection.name)}</strong>
             <span>${collection.count}</span>
           </button>
         `).join("")}
@@ -2929,10 +3079,10 @@ function createContentManagePanel() {
               type="button"
               class="secondary"
               data-action="assign-content-collection"
-              data-collection-id="${collection.id}"
+              data-collection-id="${safeAttr(collection.id)}"
               ${selectedCount ? "" : "disabled"}
             >
-              ${collection.name}
+              ${safeText(collection.name)}
             </button>
           `).join("")}
           <button type="button" class="secondary" data-action="clear-content-collections" ${selectedCount ? "" : "disabled"}>Clear Collections</button>
@@ -2947,15 +3097,16 @@ function createContentManagePanel() {
 function createTargetDeviceButton(screen) {
   const isPrimary = screen.id === state.ui.contentScreenId;
   const isSelected = getContentTargetIds().includes(screen.id);
+  const screenId = safeAttr(screen.id);
   return `
     <button
       type="button"
       class="broadcast-chip ${isSelected ? "is-selected" : ""} ${isPrimary ? "is-primary" : ""}"
       data-action="toggle-content-target"
-      data-screen-id="${screen.id}"
+      data-screen-id="${screenId}"
     >
-      <strong>${screen.name}</strong>
-      <span>${screen.device.host || "No host"}</span>
+      <strong>${safeText(screen.name)}</strong>
+      <span>${safeText(screen.device.host || "No host")}</span>
     </button>
   `;
 }
@@ -2988,8 +3139,8 @@ function createContentActionBar() {
     <div class="content-action-bar">
       <div class="content-footer-copy">
         <span class="device-summary-kicker">Selection</span>
-        <strong>${selectedImage ? selectedImage.name : "No image selected"}</strong>
-        <span>${targetScreens.length ? `${targetScreens.map((screen) => screen.name).join(", ")}` : "No target devices selected"}</span>
+        <strong>${selectedImage ? safeText(selectedImage.name) : "No image selected"}</strong>
+        <span>${targetScreens.length ? safeText(targetScreens.map((screen) => screen.name).join(", ")) : "No target devices selected"}</span>
       </div>
       <div class="content-footer-actions">
         <button type="button" class="secondary" data-action="cancel-content">Cancel</button>
@@ -3014,6 +3165,7 @@ function sendStepIcon(type, stepState) {
     connect: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20a8 8 0 1 0-8-8" /><path d="M12 8v4l2.5 2.5" /></svg>`,
     command: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h11" /><path d="M11 4l4 3-4 3" /><path d="M20 17H9" /><path d="m13 14-4 3 4 3" /></svg>`,
     download: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v11" /><path d="m8 13 4 4 4-4" /><path d="M5 19h14" /></svg>`,
+    panel: `<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="13" rx="2" /><path d="M8 20h8" /><path d="M12 17v3" /></svg>`,
     check: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6L9 17l-5-5" /></svg>`
   };
   return icons[type] || icons.check;
@@ -3026,9 +3178,57 @@ function formatTargetMilestones(target) {
   if (m.connected) items.push({ label: "Connected", done: true });
   if (m.contentSet) items.push({ label: "Command set", done: true });
   if (m.contentJsonFetched) items.push({ label: "Manifest fetched", done: true });
-  if (m.imageFetched) items.push({ label: "Image delivered", done: true });
+  if (m.imageFetched) items.push({ label: "Image fetched", done: true });
   if (target.status === "failed") items.push({ label: target.error || "Failed", done: false, error: true });
   return items;
+}
+
+function createSendFlowOverlay() {
+  const flow = state.ui.sendFlow;
+  if (!flow?.active) {
+    return "";
+  }
+  return flow.minimized ? createSendFlowMinimized() : createSendFlowModal();
+}
+
+function createSendFlowMinimized() {
+  const flow = state.ui.sendFlow;
+  if (!flow?.active) {
+    return "";
+  }
+
+  const isFailed = flow.status === "failed";
+  const hasUnverified = flow.targets?.some((target) => target.status === "unverified");
+  const receiptConfirmed = flow.targets?.length && flow.targets.every((target) => target.milestones?.imageFetched);
+  const latestEvent = getLatestSendFlowEvent(flow.targets);
+  const startedAt = Date.parse(flow.createdAt || "");
+  const elapsedLabel = Number.isFinite(startedAt)
+    ? formatDurationCompact(Date.now() - startedAt)
+    : "";
+  const statusLabel = isFailed
+    ? (hasUnverified ? "Unverified" : "Failed")
+    : receiptConfirmed
+      ? "Received by Frame"
+      : "Sending";
+  const statusClass = isFailed
+    ? (hasUnverified ? "is-warning" : "is-error")
+    : receiptConfirmed
+      ? "is-estimated"
+      : "is-running";
+
+  return `
+    <aside class="send-monitor-chip ${statusClass}" role="status" aria-live="polite">
+      <button type="button" class="send-monitor-chip-main" data-action="expand-send-flow">
+        <span class="send-monitor-chip-kicker">${statusLabel}</span>
+        <strong>${safeText(flow.imageName)}</strong>
+        <span>${latestEvent ? `${safeText(latestEvent.targetName)}: ${safeText(latestEvent.label)}` : (elapsedLabel ? `Elapsed ${safeText(elapsedLabel)}` : "Open send monitor")}</span>
+      </button>
+      <div class="send-monitor-chip-actions">
+        <button type="button" class="secondary" data-action="expand-send-flow">Open</button>
+        ${isFailed || receiptConfirmed ? `<button type="button" class="secondary" data-action="close-send-flow">Done</button>` : ""}
+      </div>
+    </aside>
+  `;
 }
 
 function createSendFlowModal() {
@@ -3038,20 +3238,39 @@ function createSendFlowModal() {
   }
 
   const isRunning = flow.status === "running" || flow.status === "starting";
-  const isComplete = flow.status === "completed";
   const isFailed = flow.status === "failed";
-
-  const hasUnverified = flow.targets?.some((t) => t.status === "unverified");
-  const statusLabel = isComplete ? "Delivered" : isFailed && hasUnverified ? "Unverified" : isFailed ? "Failed" : "Sending";
-  const statusClass = isComplete ? "is-complete" : isFailed && hasUnverified ? "is-warning" : isFailed ? "is-error" : "is-running";
+  const hasUnverified = flow.targets?.some((target) => target.status === "unverified");
+  const receiptConfirmed = flow.targets?.length && flow.targets.every((target) => target.milestones?.imageFetched);
+  const latestEvent = getLatestSendFlowEvent(flow.targets);
+  const receiptEvent = getSendFlowReceiptEvent(flow.targets);
+  const startedAt = Date.parse(flow.createdAt || "");
+  const elapsedLabel = Number.isFinite(startedAt)
+    ? formatDurationCompact(Date.now() - startedAt)
+    : "";
+  const latestEventAge = latestEvent?.stamp ? formatDurationCompact(Date.now() - latestEvent.stamp) : "";
+  const receiptAge = receiptEvent?.stamp ? formatDurationCompact(Date.now() - receiptEvent.stamp) : "";
+  const statusLabel = isFailed
+    ? (hasUnverified ? "Unverified" : "Failed")
+    : receiptConfirmed
+      ? "Received by Frame"
+      : "Sending";
+  const statusClass = isFailed
+    ? (hasUnverified ? "is-warning" : "is-error")
+    : receiptConfirmed
+      ? "is-estimated"
+      : "is-running";
+  const statusDetail = isFailed
+    ? (flow.error || "The send did not complete.")
+    : receiptConfirmed
+      ? "Frame receipt is confirmed. Visible panel refresh is still an estimate, not a verified signal."
+      : "Tracking verified device milestones as the frame wakes, connects, and requests the image.";
 
   return `
-    <div class="modal-backdrop modal-backdrop--send"></div>
-    <section class="modal-shell modal-shell--send" role="dialog" aria-modal="true" aria-label="Send progress">
+    <section class="modal-shell modal-shell--send" role="region" aria-label="Send monitor">
       <div class="send-modal-status-bar ${statusClass}">
         <div class="send-modal-status-icon">
-          ${isComplete
-            ? `<svg viewBox="0 0 24 24"><path d="M20 6L9 17l-5-5" /></svg>`
+          ${receiptConfirmed && !isFailed
+            ? sendStepIcon("panel", "active")
             : isFailed && hasUnverified
               ? `<svg viewBox="0 0 24 24"><path d="M12 9v4" /><circle cx="12" cy="16" r="1" /><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" /></svg>`
               : isFailed
@@ -3060,11 +3279,25 @@ function createSendFlowModal() {
         </div>
         <div class="send-modal-status-copy">
           <strong>${statusLabel}</strong>
-          <span>${flow.imageName}</span>
+          <span>${safeText(flow.imageName)}</span>
         </div>
+        <button type="button" class="icon-button icon-button--ghost icon-button--small send-monitor-hide" data-action="hide-send-flow" aria-label="Hide send monitor">
+          ${iconSvg("close")}
+        </button>
         ${isRunning ? `<span class="send-modal-pulse"></span>` : ""}
       </div>
       <div class="modal-body modal-body--send">
+        <div class="send-monitor-summary">
+          <div class="send-monitor-fact">
+            <span>Elapsed</span>
+            <strong>${elapsedLabel || "Just started"}</strong>
+          </div>
+          <div class="send-monitor-fact send-monitor-fact--wide">
+            <span>Last real event</span>
+            <strong>${latestEvent ? `${safeText(latestEvent.targetName)}: ${safeText(latestEvent.label)}` : "Waiting for first frame response"}</strong>
+            <em>${latestEventAge ? `${safeText(latestEventAge)} ago` : ""}</em>
+          </div>
+        </div>
         <div class="send-timeline">
           ${flow.steps
             .map(
@@ -3077,7 +3310,7 @@ function createSendFlowModal() {
                     ${index < flow.steps.length - 1 ? `<div class="send-timeline-line"></div>` : ""}
                   </div>
                   <div class="send-timeline-content">
-                    <strong>${step.title}</strong>
+                    <strong>${step.title}${step.estimated ? `<em class="send-step-badge">Estimated</em>` : ""}</strong>
                     <span>${step.detail}</span>
                   </div>
                 </div>
@@ -3100,11 +3333,11 @@ function createSendFlowModal() {
                       <div class="send-target-card ${targetDone ? "is-done" : ""} ${targetUnverified ? "is-warning" : ""} ${targetFailed ? "is-error" : ""}">
                         <div class="send-target-header">
                           <div class="send-target-name">
-                            <strong>${target.name}</strong>
-                            <span>${target.host}</span>
+                            <strong>${safeText(target.name)}</strong>
+                            <span>${safeText(target.host)}</span>
                           </div>
                           <span class="send-target-badge ${targetDone ? "is-done" : targetUnverified ? "is-warning" : targetFailed ? "is-error" : "is-active"}">
-                            ${targetDone ? "Delivered" : targetUnverified ? "Unverified" : targetFailed ? "Failed" : "Sending"}
+                            ${targetDone ? "Received" : targetUnverified ? "Unverified" : targetFailed ? "Failed" : "Sending"}
                           </span>
                         </div>
                         ${milestones.length ? `
@@ -3129,16 +3362,23 @@ function createSendFlowModal() {
             `
             : ""
         }
+        <div class="send-monitor-note ${receiptConfirmed && !isFailed ? "is-estimated" : ""}">
+          <strong>${receiptConfirmed && !isFailed ? "What happens next" : "What this monitor can verify"}</strong>
+          <span>${receiptConfirmed && !isFailed
+            ? `Frame receipt ${receiptAge ? `was confirmed ${receiptAge} ago` : "is confirmed"}. Panel flicker or visible refresh usually starts within about 15 seconds and can take up to about 45 seconds. That final on-screen apply is estimated only.`
+            : safeText(statusDetail)}</span>
+        </div>
         ${isFailed && hasUnverified
-          ? `<div class="send-warning-banner">Sent but not confirmed — the frame may be asleep or unreachable. Try pressing the wake button on the frame and sending again.</div>`
+          ? `<div class="send-warning-banner">The app sent the command, but one or more frames never confirmed the image fetch. Try waking the frame and sending again.</div>`
           : isFailed
-            ? `<div class="send-error-banner">${flow.error}</div>`
+            ? `<div class="send-error-banner">${safeText(flow.error)}</div>`
             : ""}
       </div>
       <div class="modal-footer">
-        ${isRunning
-          ? `<button type="button" class="secondary" disabled>Sending...</button>`
-          : `<button type="button" data-action="close-send-flow">${isComplete ? "Done" : "Close"}</button>`}
+        <button type="button" class="secondary" data-action="hide-send-flow">${isRunning ? "Hide" : "Minimize"}</button>
+        ${isFailed || receiptConfirmed
+          ? `<button type="button" data-action="close-send-flow">Done</button>`
+          : `<button type="button" class="secondary" disabled>Sending...</button>`}
       </div>
     </section>
   `;
@@ -3628,8 +3868,110 @@ function createWizardGenerateStep() {
   `;
 }
 
+function createQuickModePanel() {
+  const { quickQuery, quickRun } = state.studio.albumArt;
+  const enabledScreens = state.project.screens.filter((s) => s.enabled);
+  const screenCount = Math.min(enabledScreens.length, 3);
+  const isRunning = quickRun?.status === "running";
+  const isDone = quickRun?.status === "done";
+  const isError = quickRun?.status === "error";
+
+  const stepIcons = {
+    idle: `<span class="quick-step-icon"></span>`,
+    running: `<span class="quick-step-icon is-running"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9" /><path d="M12 7v5l3 3" /></svg></span>`,
+    done: `<span class="quick-step-icon is-done"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6L9 17l-5-5" /></svg></span>`,
+    error: `<span class="quick-step-icon is-error"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6L6 18M6 6l12 12" /></svg></span>`
+  };
+
+  const stepsHtml = (quickRun?.steps || []).map((step) => `
+    <div class="quick-step ${step.status === "running" ? "is-running" : step.status === "done" ? "is-done" : step.status === "error" ? "is-error" : ""}">
+      ${stepIcons[step.status] || stepIcons.idle}
+      <div class="quick-step-body">
+        <strong>${safeText(step.label)}</strong>
+        ${step.detail ? `<span>${safeText(step.detail)}</span>` : ""}
+      </div>
+    </div>
+  `).join("");
+
+  const resultHtml = isDone ? `
+    <div class="quick-send-result">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6L9 17l-5-5" /></svg>
+      <div>
+        <strong>Done</strong>
+        <span>${safeText(quickRun.detail || "Posters generated and sent to your frames.")}</span>
+      </div>
+      <button type="button" class="secondary" data-action="open-generated-content">View in Content</button>
+    </div>
+  ` : "";
+
+  const errorHtml = isError ? `
+    <div class="quick-send-error">${safeText(quickRun.error || "Something went wrong.")}</div>
+  ` : "";
+
+  if (!screenCount) {
+    return `
+      <div class="quick-send-panel">
+        <p class="quick-send-empty">No enabled frames found. Add and enable at least one device in the Devices section first.</p>
+      </div>
+    `;
+  }
+
+  return `
+    <div class="quick-send-panel">
+      <div class="quick-send-description">
+        <p>Type an artist name. This will find their top 3 albums on Spotify, generate a poster for each, and send them to your ${screenCount} frame${screenCount === 1 ? "" : "s"}.</p>
+      </div>
+      <div class="quick-send-field">
+        <input
+          id="quick-send-artist-query"
+          type="text"
+          placeholder="e.g. Radiohead, Björk, Kendrick Lamar"
+          value="${safeAttr(quickQuery)}"
+          autocomplete="off"
+          spellcheck="false"
+          ${isRunning ? "disabled" : ""}
+        />
+        <button
+          type="button"
+          data-action="album-art-quick-run"
+          ${isRunning || !quickQuery.trim() ? "disabled" : ""}
+        >${isRunning ? "Running…" : "Create &amp; Send"}</button>
+      </div>
+      ${quickRun ? `<div class="quick-send-steps">${stepsHtml}</div>` : ""}
+      ${resultHtml}
+      ${errorHtml}
+    </div>
+  `;
+}
+
 function renderAlbumArtWorkspace() {
-  const step = state.studio.albumArt.step || "pick";
+  const { quickMode, step } = state.studio.albumArt;
+
+  const modeToggle = `
+    <div class="wizard-mode-toggle">
+      <button
+        type="button"
+        class="${!quickMode ? "is-selected" : ""}"
+        data-action="toggle-album-art-quick-mode"
+        data-mode="wizard"
+      >Wizard</button>
+      <button
+        type="button"
+        class="${quickMode ? "is-selected" : ""}"
+        data-action="toggle-album-art-quick-mode"
+        data-mode="quick"
+      >Quick Send</button>
+    </div>
+  `;
+
+  if (quickMode) {
+    return `
+      <section class="studio-plugin-body wizard-body">
+        ${modeToggle}
+        ${createQuickModePanel()}
+      </section>
+    `;
+  }
 
   let stepContent = "";
   if (step === "pick") {
@@ -3642,6 +3984,7 @@ function renderAlbumArtWorkspace() {
 
   return `
     <section class="studio-plugin-body wizard-body">
+      ${modeToggle}
       ${createWizardStepIndicator()}
       ${stepContent}
     </section>
@@ -3759,6 +4102,8 @@ function createScreenModal() {
   if (!screen) {
     return "";
   }
+  const screenId = safeAttr(screen.id);
+  const screenName = safeText(screen.name);
 
   return `
     <div class="modal-backdrop" data-action="close-modal"></div>
@@ -3766,7 +4111,7 @@ function createScreenModal() {
       <div class="modal-header">
         <div>
           <p class="modal-kicker">Device Details</p>
-          <h2>${screen.name}</h2>
+          <h2>${screenName}</h2>
         </div>
         <button type="button" class="icon-button icon-button--ghost" data-action="close-modal" aria-label="Close device details">
           ${iconSvg("close")}
@@ -3785,7 +4130,7 @@ function createScreenModal() {
         ${createScreenForm(screen)}
       </div>
       <div class="modal-footer">
-        <button type="button" data-action="save-screen" data-screen-id="${screen.id}">Save</button>
+        <button type="button" data-action="save-screen" data-screen-id="${screenId}">Save</button>
       </div>
     </section>
   `;
@@ -3812,8 +4157,8 @@ function createSettingsModal() {
         <section class="modal-section">
           <h2>Settings</h2>
           <p class="spotify-copy">This area will hold app-level options later. Device inventory lives on Devices, content sending lives in Content, and imports or automations live in Studio.</p>
-          ${state.actions.notice ? `<div class="action-status notice">${state.actions.notice}</div>` : ""}
-          ${state.actions.error ? `<div class="action-status error">${state.actions.error}</div>` : ""}
+          ${state.actions.notice ? `<div class="action-status notice">${safeText(state.actions.notice)}</div>` : ""}
+          ${state.actions.error ? `<div class="action-status error">${safeText(state.actions.error)}</div>` : ""}
         </section>
       </div>
     </section>
@@ -3847,19 +4192,22 @@ function createDeviceManagementModal() {
 }
 
 function createManagedRoomCard(room) {
+  const roomId = safeAttr(room.id);
+  const roomName = safeText(room.name);
+  const roomNameAttr = safeAttr(room.name);
   return `
     <article class="manage-room-card">
       <div class="manage-entity-header">
         <div>
           <span class="device-summary-kicker">Room</span>
-          <strong>${room.name}</strong>
+          <strong>${roomName}</strong>
         </div>
       </div>
       <div class="manage-search-group">
         <span class="device-summary-kicker">Room Name</span>
         <div class="spotify-search-row manage-search-row">
-          <input id="manage-room-${room.id}" type="text" value="${room.name}" />
-          <button type="button" class="btn btn-secondary" data-action="rename-room" data-room-id="${room.id}">Rename Room</button>
+          <input id="manage-room-${roomId}" type="text" value="${roomNameAttr}" />
+          <button type="button" class="btn btn-secondary" data-action="rename-room" data-room-id="${roomId}">Rename Room</button>
         </div>
       </div>
       <div class="manage-wall-list">
@@ -3872,26 +4220,31 @@ function createManagedRoomCard(room) {
 function createManagedWallCard(room, wall) {
   const occupancy = getWallSlotOccupancy(wall);
   const warnings = getWallSlotWarnings(occupancy);
+  const roomId = safeAttr(room.id);
+  const wallId = safeAttr(wall.id);
+  const roomName = safeText(room.name);
+  const wallName = safeText(wall.name);
+  const roomWallLabel = safeAttr(`${room.name} / ${wall.name}`);
   return `
     <article class="manage-wall-card">
       <div class="manage-entity-header">
-        <div class="wall-group-breadcrumb" aria-label="${room.name} / ${wall.name}">
-          <span class="wall-group-crumb">${room.name}</span>
+        <div class="wall-group-breadcrumb" aria-label="${roomWallLabel}">
+          <span class="wall-group-crumb">${roomName}</span>
           <span class="wall-group-separator">/</span>
-          <span class="wall-group-crumb wall-group-crumb--current">${wall.name}</span>
+          <span class="wall-group-crumb wall-group-crumb--current">${wallName}</span>
         </div>
         <span class="wall-group-count">${wall.screens.length} ${wall.screens.length === 1 ? "frame" : "frames"}</span>
       </div>
       <div class="manage-search-group">
         <span class="device-summary-kicker">Wall Name</span>
         <div class="spotify-search-row manage-search-row">
-          <input id="manage-wall-${wall.id}" type="text" value="${wall.name}" />
-          <button type="button" class="btn btn-secondary" data-action="rename-wall" data-wall-id="${wall.id}" data-room-id="${room.id}">Rename Wall</button>
+          <input id="manage-wall-${wallId}" type="text" value="${safeAttr(wall.name)}" />
+          <button type="button" class="btn btn-secondary" data-action="rename-wall" data-wall-id="${wallId}" data-room-id="${roomId}">Rename Wall</button>
         </div>
       </div>
       ${warnings.length ? `
         <div class="manage-wall-warning">
-          ${warnings.map((warning) => `<span>${warning}</span>`).join("")}
+          ${warnings.map((warning) => `<span>${safeText(warning)}</span>`).join("")}
         </div>
       ` : ""}
       <div class="manage-slot-list">
@@ -3901,8 +4254,8 @@ function createManagedWallCard(room, wall) {
             <div class="manage-slot-devices">
               ${slot.screens.length
                 ? slot.screens.map((screen) => `
-                    <button type="button" class="manage-screen-pill" data-action="open-screen-modal" data-screen-id="${screen.id}">
-                      ${screen.name}
+                    <button type="button" class="manage-screen-pill" data-action="open-screen-modal" data-screen-id="${safeAttr(screen.id)}">
+                      ${safeText(screen.name)}
                     </button>
                   `).join("")
                 : `<span class="manage-slot-empty">No frame assigned</span>`}
@@ -4094,6 +4447,9 @@ function createDeleteImportedAlbumsModal() {
 
 function createSpotifySettingsModal() {
   const draft = state.ui.spotifySettingsDraft || normalizeSpotifySettings(state.spotifySettings);
+  const clientId = escapeHtml(draft.clientId);
+  const market = escapeHtml(draft.market);
+  const secretPlaceholder = escapeHtml(state.spotifySettings.configured ? "Leave blank to keep saved secret" : "Paste client secret");
   return `
     <div class="modal-backdrop" data-action="close-modal"></div>
     <section class="modal-shell modal-shell--compact" role="dialog" aria-modal="true" aria-label="Spotify settings">
@@ -4112,19 +4468,19 @@ function createSpotifySettingsModal() {
           <div class="field-row">
             <label>
               Spotify Client ID
-              <input id="spotify-settings-client-id" type="text" value="${draft.clientId}" />
+              <input id="spotify-settings-client-id" type="text" value="${clientId}" />
             </label>
             <label>
               Market
-              <input id="spotify-settings-market" type="text" value="${draft.market}" maxlength="2" />
+              <input id="spotify-settings-market" type="text" value="${market}" maxlength="2" />
             </label>
           </div>
           <label>
             Spotify Client Secret
-            <input id="spotify-settings-client-secret" type="password" value="${draft.clientSecret}" />
+            <input id="spotify-settings-client-secret" type="password" value="" placeholder="${secretPlaceholder}" />
           </label>
           <p class="modal-inline-note">
-            Current source: ${state.spotifySettings.source === "saved" ? "saved plugin settings" : ".env defaults"}.
+            Current source: ${state.spotifySettings.source === "saved" ? "saved plugin settings" : ".env defaults"}. Saved secrets are not displayed; leave the secret blank to keep the current value.
           </p>
         </section>
       </div>
@@ -4196,15 +4552,19 @@ function createContentEditModal() {
   }
   const draft = editState.draft;
   const cropMode = getContentEditCropMode(editState);
-  const dimensionsLine = formatImageDimensions(image);
+  const cropModeLabel = getContentEditCropModeLabel(editState);
   const targetScreen = getCanonicalContentTargetScreen();
   const targetDims = targetScreen?.size
     ? `Canonical Samsung frame: ${targetScreen.size.width}×${targetScreen.size.height}`
     : "Canonical frame size unavailable";
+  const previewAspect = targetScreen?.size?.width && targetScreen?.size?.height
+    ? `${targetScreen.size.width} / ${targetScreen.size.height}`
+    : "1 / 1";
   const previewFacts = getContentAssetFactLabels(image, { sourcePrefix: true });
   const anchors = ["center", "top", "bottom", "left", "right"];
   const saving = Boolean(editState.saving);
   const previewUrl = buildContentEditPreviewUrl(image.name, draft, image.modifiedAt);
+  const sourceUrl = `${image.url}?t=${encodeURIComponent(image.modifiedAt || "")}`;
   const discardPrompt = editState.confirmDiscard
     ? `
       <div class="content-edit-discard">
@@ -4222,10 +4582,12 @@ function createContentEditModal() {
     <div class="modal-backdrop" data-action="cancel-content-edit"></div>
     <section class="modal-shell modal-shell--edit" role="dialog" aria-modal="true" aria-label="Edit image">
       <div class="modal-header">
-        <div>
-          <p class="modal-kicker">Edit Image</p>
+        <div class="content-edit-title-block">
+          <div class="content-edit-title-row">
+            <p class="modal-kicker">Edit Image</p>
+            <span class="content-edit-mode-chip" data-content-edit-mode-label>${cropModeLabel}</span>
+          </div>
           <h2>${image.name}</h2>
-          <p class="send-flow-copy">${dimensionsLine || ""}</p>
         </div>
         <button type="button" class="icon-button icon-button--ghost" data-action="cancel-content-edit" aria-label="Close">
           ${iconSvg("close")}
@@ -4233,16 +4595,36 @@ function createContentEditModal() {
       </div>
       <div class="modal-body modal-body--edit">
         <div class="content-edit-preview">
-          <div class="content-edit-preview-stage">
-            <img
-              id="content-edit-preview-img"
-              src="${previewUrl}"
-              alt="${image.name}"
-            />
+          <div
+            class="content-edit-preview-stage ${cropMode === "manual" ? "is-manual" : "is-preset"} ${editState.confirmDiscard ? "is-confirming-discard" : ""}"
+            data-crop-mode="${cropMode}"
+            data-preview-status="settled"
+          >
+            <div class="content-edit-preview-ghost" aria-hidden="true">
+              <div class="content-edit-preview-artwork" id="content-edit-preview-ghost-artwork">
+                <img id="content-edit-preview-ghost-img" src="${sourceUrl}" alt="" />
+              </div>
+            </div>
+            <div
+              class="content-edit-preview-frame"
+              id="content-edit-preview-frame"
+              style="--content-edit-preview-aspect:${previewAspect};"
+            >
+              <div class="content-edit-preview-artwork" id="content-edit-preview-live-artwork" aria-hidden="true">
+                <img id="content-edit-preview-live-img" src="${sourceUrl}" alt="" />
+              </div>
+              <img
+                id="content-edit-preview-img"
+                class="content-edit-preview-rendered"
+                src="${previewUrl}"
+                alt="${image.name}"
+              />
+              <div class="content-edit-preview-frame-outline" aria-hidden="true"></div>
+            </div>
+            ${discardPrompt}
           </div>
           <p class="send-flow-copy content-edit-target-note">${targetDims}</p>
           ${createContentMetaChips(previewFacts, "content-meta-row--center")}
-          ${discardPrompt}
         </div>
         <form id="content-edit-form" class="content-edit-form" onsubmit="return false;">
           <fieldset class="content-edit-group">
@@ -4269,7 +4651,7 @@ function createContentEditModal() {
             </div>
             ${cropMode === "manual"
               ? `
-                <p class="content-edit-group-copy">Zoom and move the source image inside the frame. Fit mode sets the starting crop.</p>
+                <p class="content-edit-group-copy">Drag inside the preview, scroll to zoom, or use the sliders to frame the image. Fit mode sets the starting crop.</p>
                 <label>
                   <span>Fit mode</span>
                   <select name="fit">
@@ -4282,7 +4664,7 @@ function createContentEditModal() {
                 </div>
                 <label class="content-edit-slider">
                   <span>Zoom <em data-value-for="zoom">${draft.zoom.toFixed(2)}</em></span>
-                  <input type="range" name="zoom" min="1" max="3" step="0.05" value="${draft.zoom}" />
+                  <input type="range" name="zoom" min="1" max="5" step="0.05" value="${draft.zoom}" />
                 </label>
                 <label class="content-edit-slider">
                   <span>Horizontal <em data-value-for="panX">${draft.panX.toFixed(2)}</em></span>
@@ -4424,9 +4806,6 @@ function createSectionPanel() {
                 </div>
               </div>
               ${createContentBrowseCollectionsPanel()}
-              ${createContentBrowseLayoutHintPanel()}
-              ${createContentBrowseAutomationHintPanel()}
-              ${createContentCollectionScopePanel()}
               ${createContentBrowseToolbar()}
             `
             : ""
@@ -4473,13 +4852,14 @@ function createRoomGroup(room) {
 }
 
 function createWallGroup(room, wall) {
+  const roomWallLabel = safeAttr(`${room.name} / ${wall.name}`);
   return `
     <section class="wall-group">
       <div class="wall-group-header">
-        <div class="wall-group-breadcrumb" aria-label="${room.name} / ${wall.name}">
-          <span class="wall-group-crumb">${room.name}</span>
+        <div class="wall-group-breadcrumb" aria-label="${roomWallLabel}">
+          <span class="wall-group-crumb">${safeText(room.name)}</span>
           <span class="wall-group-separator">/</span>
-          <span class="wall-group-crumb wall-group-crumb--current">${wall.name}</span>
+          <span class="wall-group-crumb wall-group-crumb--current">${safeText(wall.name)}</span>
         </div>
         <span class="wall-group-count">${wall.screens.length} ${wall.screens.length === 1 ? "frame" : "frames"}</span>
       </div>
@@ -4488,10 +4868,7 @@ function createWallGroup(room, wall) {
   `;
 }
 
-function createActiveModal() {
-  if (state.ui.sendFlow?.active) {
-    return createSendFlowModal();
-  }
+function createPrimaryModal() {
   if (state.ui.modal === "content-preview") {
     return createContentPreviewModal();
   }
@@ -4556,7 +4933,8 @@ function renderWorkspace() {
         ${createContentActionBar()}
         <input id="content-upload-input" type="file" accept=".jpg,.jpeg,.png,.webp,image/jpeg,image/png,image/webp" multiple hidden />
       </section>
-      ${createActiveModal()}
+      ${createPrimaryModal()}
+      ${createSendFlowOverlay()}
       ${createToastLayer()}
     </main>
   `;
@@ -4664,6 +5042,17 @@ function bindWorkspaceEvents() {
   document.getElementById("studio-template-select")?.addEventListener("change", (event) => {
     state.studio.albumArt.templateId = event.target.value;
     renderWorkspace();
+  });
+
+  document.getElementById("quick-send-artist-query")?.addEventListener("input", (event) => {
+    state.studio.albumArt.quickQuery = event.target.value;
+    renderWorkspace();
+  });
+  document.getElementById("quick-send-artist-query")?.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      app.querySelector('[data-action="album-art-quick-run"]')?.click();
+    }
   });
 
   document.getElementById("content-library-search")?.addEventListener("input", (event) => {
@@ -5511,6 +5900,128 @@ async function handleAction(button) {
     return;
   }
 
+  if (action === "toggle-album-art-quick-mode") {
+    const mode = button.dataset.mode || "quick";
+    state.studio.albumArt.quickMode = mode === "quick";
+    renderWorkspace();
+    return;
+  }
+
+  if (action === "album-art-quick-run") {
+    const artistName = state.studio.albumArt.quickQuery.trim();
+    if (!artistName) {
+      return;
+    }
+    const enabledScreens = state.project.screens.filter((s) => s.enabled);
+    if (!enabledScreens.length) {
+      state.studio.albumArt.quickRun = { status: "error", error: "No enabled frames found.", steps: [] };
+      renderWorkspace();
+      return;
+    }
+
+    const mkStep = (label) => ({ label, status: "idle", detail: "" });
+    const steps = [
+      mkStep("Find artist on Spotify"),
+      mkStep("Import top 3 albums"),
+      mkStep("Generate posters"),
+      mkStep("Send to frames")
+    ];
+    const setStep = (index, status, detail = "") => {
+      steps[index] = { ...steps[index], status, detail };
+      state.studio.albumArt.quickRun = { status: "running", steps: [...steps], error: "" };
+      renderWorkspace();
+    };
+
+    state.studio.albumArt.quickRun = { status: "running", steps: [...steps], error: "" };
+    renderWorkspace();
+
+    try {
+      // Step 1 — find artist
+      setStep(0, "running");
+      const artistData = await apiGetJson(`/api/spotify/search/artists?q=${encodeURIComponent(artistName)}`);
+      const artist = artistData[0];
+      if (!artist) {
+        throw new Error(`No Spotify artist found for "${artistName}".`);
+      }
+      setStep(0, "done", artist.name);
+
+      // Step 2 — import top 3 albums
+      setStep(1, "running");
+      const albumsData = await apiGetJson(`/api/spotify/artists/${encodeURIComponent(artist.id)}/albums?filter=album&offset=0`);
+      const topAlbums = (albumsData.items || []).slice(0, 3);
+      if (!topAlbums.length) {
+        throw new Error(`No albums found for ${artist.name} on Spotify.`);
+      }
+      const importedSlugs = [];
+      for (const album of topAlbums) {
+        const imported = await apiPostJson("/api/import/spotify/album", { albumId: album.id });
+        importedSlugs.push(imported.slug);
+      }
+      setStep(1, "done", `Imported ${importedSlugs.length} album${importedSlugs.length === 1 ? "" : "s"}`);
+
+      // Step 3 — generate posters
+      setStep(2, "running");
+      const genPayload = await apiPostJson("/api/studio/plugins/album-art/generate", {
+        albumSlugs: importedSlugs,
+        templateId: state.studio.albumArt.templateId
+      });
+      const generatedNames = (genPayload.generated || []).map((img) => img.name);
+      if (!generatedNames.length) {
+        throw new Error("Poster generation produced no images.");
+      }
+      await refreshCatalogAndAlbums();
+      const outputPayload = await loadOutputImages();
+      state.outputImages = outputPayload.images || [];
+      state.studio.albumArt.generatedImageNames = generatedNames;
+      setStep(2, "done", `${generatedNames.length} poster${generatedNames.length === 1 ? "" : "s"} ready`);
+
+      // Step 4 — send to frames
+      setStep(3, "running");
+      const pairs = generatedNames.map((name, i) => ({ name, screen: enabledScreens[i % enabledScreens.length] }));
+      const sendJobs = await Promise.all(
+        pairs.map(({ name, screen }) =>
+          apiPostJson("/api/content/send", { imageName: name, screenIds: [screen.id] })
+        )
+      );
+      // Poll all jobs until terminal
+      const pollJob = async (jobId) => {
+        for (let i = 0; i < 120; i++) {
+          const job = await apiGetJson(`/api/send-jobs/${jobId}`);
+          if (job.status === "completed" || job.status === "failed") {
+            return job;
+          }
+          await new Promise((r) => setTimeout(r, 1200));
+        }
+        return { status: "failed", error: "Timed out waiting for send job." };
+      };
+      const results = await Promise.all(sendJobs.map((j) => pollJob(j.jobId)));
+      const deliveries = results.map((result, index) => ({ result, pair: pairs[index] }));
+      const successfulDeliveries = deliveries.filter(({ result }) => result.status !== "failed");
+      const failedCount = deliveries.length - successfulDeliveries.length;
+      if (failedCount === results.length) {
+        throw new Error("All sends failed. Check that your frames are online and reachable.");
+      }
+      state.deviceState = await loadDeviceState();
+      const sentCount = successfulDeliveries.length;
+      const targetNames = successfulDeliveries.map(({ pair }) => pair.screen.name).join(", ");
+      setStep(3, "done", `Sent to ${targetNames}`);
+
+      const detail = failedCount
+        ? `${sentCount} of ${results.length} posters delivered. ${failedCount} frame${failedCount === 1 ? "" : "s"} did not confirm receipt.`
+        : `${sentCount} poster${sentCount === 1 ? "" : "s"} sent to your frame${sentCount === 1 ? "" : "s"}.`;
+      state.studio.albumArt.quickRun = { status: "done", steps: [...steps], detail, error: "" };
+      state.studio.albumArt.quickQuery = "";
+    } catch (error) {
+      const failedIndex = steps.findIndex((s) => s.status === "running");
+      if (failedIndex >= 0) {
+        steps[failedIndex] = { ...steps[failedIndex], status: "error" };
+      }
+      state.studio.albumArt.quickRun = { status: "error", steps: [...steps], error: error.message, detail: "" };
+    }
+    renderWorkspace();
+    return;
+  }
+
   if (action === "toggle-spotify-import") {
     state.studio.albumArt.importCollapsed = !state.studio.albumArt.importCollapsed;
     renderWorkspace();
@@ -5937,12 +6448,28 @@ async function handleAction(button) {
     return;
   }
 
+  if (action === "hide-send-flow") {
+    if (state.ui.sendFlow) {
+      state.ui.sendFlow.minimized = true;
+    }
+    renderWorkspace();
+    return;
+  }
+
+  if (action === "expand-send-flow") {
+    if (state.ui.sendFlow) {
+      state.ui.sendFlow.minimized = false;
+    }
+    renderWorkspace();
+    return;
+  }
+
   if (action === "close-send-flow") {
     stopSendFlowPolling();
     state.deviceState = await loadDeviceState();
     if (state.ui.sendFlow?.status === "completed") {
       const sentName = state.ui.sendFlow.imageName || "";
-      state.actions.notice = `Sent ${sentName} to ${state.ui.sendFlow.targetNames.join(", ")}.`;
+      state.actions.notice = `Frame receipt confirmed for ${sentName} on ${state.ui.sendFlow.targetNames.join(", ")}.`;
       state.actions.error = "";
       if (sentName && !sentName.startsWith("Set: ")) {
         const current = getContentImageMeta(sentName);
@@ -6414,19 +6941,62 @@ function bindContentEditForm() {
   if (!form || !state.ui.contentEdit) {
     return;
   }
+  const previewStage = document.querySelector(".content-edit-preview-stage");
+  const previewFrame = document.getElementById("content-edit-preview-frame");
   const previewImg = document.getElementById("content-edit-preview-img");
+  const liveArtwork = document.getElementById("content-edit-preview-live-artwork");
+  const liveImg = document.getElementById("content-edit-preview-live-img");
+  const ghostArtwork = document.getElementById("content-edit-preview-ghost-artwork");
+  const ghostImg = document.getElementById("content-edit-preview-ghost-img");
+  const modeLabel = document.querySelector("[data-content-edit-mode-label]");
+  const modeButtons = [...form.querySelectorAll('[data-action="set-content-edit-crop-mode"]')];
+  const sourceImage = state.outputImages.find((entry) => entry.name === state.ui.contentEdit.imageName) || null;
   let previewTimer = null;
+  let pendingRenderUrl = null;
+  let activePointerId = null;
+  let dragState = null;
 
-  const applyLiveUpdate = () => {
+  const ZOOM_MAX = 5;
+
+  const getCropMode = () => getContentEditCropMode(state.ui.contentEdit);
+
+  const setPreviewStatus = (status) => {
+    if (previewStage) {
+      previewStage.dataset.previewStatus = status;
+    }
+  };
+
+  const syncCropModeUi = () => {
+    const cropMode = getCropMode();
+    if (modeLabel) {
+      modeLabel.textContent = getContentEditCropModeLabel(state.ui.contentEdit);
+    }
+    if (previewStage) {
+      previewStage.dataset.cropMode = cropMode;
+      previewStage.classList.toggle("is-manual", cropMode === "manual");
+      previewStage.classList.toggle("is-preset", cropMode !== "manual");
+    }
+    modeButtons.forEach((button) => {
+      const isSelected = button.dataset.mode === cropMode;
+      button.classList.toggle("is-selected", isSelected);
+      button.setAttribute("aria-pressed", isSelected ? "true" : "false");
+    });
+  };
+
+  const buildPreviewFilters = (draft) => {
+    const filters = [];
+    if (Number(draft.brightness) !== 1) filters.push(`brightness(${draft.brightness})`);
+    if (Number(draft.contrast) !== 1) filters.push(`contrast(${draft.contrast})`);
+    if (Number(draft.vibrance) !== 1) filters.push(`saturate(${draft.vibrance})`);
+    if (draft.grayscale) filters.push("grayscale(1)");
+    if (draft.invert) filters.push("invert(1)");
+    if (Number(draft.blur) > 0) filters.push(`blur(${Math.min(draft.blur, 3)}px)`);
+    return filters.join(" ");
+  };
+
+  const syncValueLabels = () => {
     if (!state.ui.contentEdit) return;
     const draft = state.ui.contentEdit.draft;
-    if (previewImg) {
-      const nextUrl = buildContentEditPreviewUrl(state.ui.contentEdit.imageName, draft, Date.now());
-      clearTimeout(previewTimer);
-      previewTimer = setTimeout(() => {
-        previewImg.src = nextUrl;
-      }, 90);
-    }
     form.querySelectorAll("[data-value-for]").forEach((el) => {
       const field = el.dataset.valueFor;
       if (field in draft) {
@@ -6435,6 +7005,119 @@ function bindContentEditForm() {
         el.textContent = Number(value).toFixed(digits);
       }
     });
+  };
+
+  const syncFramingInputs = () => {
+    if (!state.ui.contentEdit) return;
+    ["zoom", "panX", "panY"].forEach((field) => {
+      const input = form.querySelector(`[name="${field}"]`);
+      if (input) {
+        input.value = String(state.ui.contentEdit.draft[field]);
+      }
+    });
+    syncValueLabels();
+  };
+
+  const getPreviewMetrics = (draft) => {
+    if (!previewFrame) {
+      return null;
+    }
+    const frameRect = previewFrame.getBoundingClientRect();
+    if (!frameRect.width || !frameRect.height) {
+      return null;
+    }
+    const sourceWidth = Number(sourceImage?.width) || liveImg?.naturalWidth || ghostImg?.naturalWidth || previewImg?.naturalWidth || 1;
+    const sourceHeight = Number(sourceImage?.height) || liveImg?.naturalHeight || ghostImg?.naturalHeight || previewImg?.naturalHeight || 1;
+    const rotate = Number(draft.rotate) || 0;
+    const rotated = rotate === 90 || rotate === 270;
+    const cropWidth = rotated ? sourceHeight : sourceWidth;
+    const cropHeight = rotated ? sourceWidth : sourceHeight;
+    const baseScale = draft.fit === "cover"
+      ? Math.max(frameRect.width / cropWidth, frameRect.height / cropHeight)
+      : Math.min(frameRect.width / cropWidth, frameRect.height / cropHeight);
+    const finalScale = Math.max(0.01, baseScale * (Number(draft.zoom) || 1));
+    const displayWidth = cropWidth * finalScale;
+    const displayHeight = cropHeight * finalScale;
+    const rawDisplayWidth = sourceWidth * finalScale;
+    const rawDisplayHeight = sourceHeight * finalScale;
+    const anchorBias = getEditCropAnchorBias(draft.cropAnchor);
+    const minLeft = Math.min(0, frameRect.width - displayWidth);
+    const maxLeft = Math.max(0, frameRect.width - displayWidth);
+    const minTop = Math.min(0, frameRect.height - displayHeight);
+    const maxTop = Math.max(0, frameRect.height - displayHeight);
+    const anchorLeft = minLeft + ((maxLeft - minLeft) * anchorBias.x);
+    const anchorTop = minTop + ((maxTop - minTop) * anchorBias.y);
+    const panRangeX = Math.abs(maxLeft - minLeft) / 2;
+    const panRangeY = Math.abs(maxTop - minTop) / 2;
+    const left = clampNumber(anchorLeft + ((Number(draft.panX) || 0) * panRangeX), minLeft, maxLeft) ?? anchorLeft;
+    const top = clampNumber(anchorTop + ((Number(draft.panY) || 0) * panRangeY), minTop, maxTop) ?? anchorTop;
+    return {
+      rotate,
+      left,
+      top,
+      displayWidth,
+      displayHeight,
+      rawDisplayWidth,
+      rawDisplayHeight,
+      panRangeX,
+      panRangeY
+    };
+  };
+
+  const applyArtworkLayout = (artwork, img, draft) => {
+    if (!artwork || !img) {
+      return null;
+    }
+    const metrics = getPreviewMetrics(draft);
+    if (!metrics) {
+      return null;
+    }
+    artwork.style.left = `${metrics.left}px`;
+    artwork.style.top = `${metrics.top}px`;
+    artwork.style.width = `${metrics.displayWidth}px`;
+    artwork.style.height = `${metrics.displayHeight}px`;
+    img.style.width = `${metrics.rawDisplayWidth}px`;
+    img.style.height = `${metrics.rawDisplayHeight}px`;
+    img.style.transform = `translate(-50%, -50%) rotate(${metrics.rotate}deg)`;
+    return metrics;
+  };
+
+  const applyLivePreview = () => {
+    if (!state.ui.contentEdit) return;
+    const draft = state.ui.contentEdit.draft;
+    const filter = buildPreviewFilters(draft);
+    [liveImg, ghostImg].forEach((img) => {
+      if (img) {
+        img.style.filter = filter;
+      }
+    });
+    applyArtworkLayout(liveArtwork, liveImg, draft);
+    applyArtworkLayout(ghostArtwork, ghostImg, draft);
+    syncCropModeUi();
+    syncValueLabels();
+  };
+
+  const scheduleRenderedPreview = () => {
+    if (!state.ui.contentEdit || !previewImg) {
+      return;
+    }
+    const nextUrl = new URL(
+      buildContentEditPreviewUrl(state.ui.contentEdit.imageName, state.ui.contentEdit.draft, Date.now()),
+      window.location.href,
+    ).toString();
+    clearTimeout(previewTimer);
+    previewTimer = setTimeout(() => {
+      pendingRenderUrl = nextUrl;
+      setPreviewStatus("rendering");
+      previewImg.src = nextUrl;
+    }, 140);
+  };
+
+  const applyLiveUpdate = () => {
+    if (!state.ui.contentEdit) return;
+    setPreviewStatus("live");
+    applyLivePreview();
+    scheduleRenderedPreview();
   };
 
   form.addEventListener("input", (event) => {
@@ -6463,6 +7146,118 @@ function bindContentEditForm() {
     state.ui.contentEdit.confirmDiscard = false;
     applyLiveUpdate();
   });
+
+  if (previewImg) {
+    previewImg.addEventListener("load", () => {
+      const loadedSrc = previewImg.currentSrc || previewImg.src;
+      if (pendingRenderUrl && loadedSrc === pendingRenderUrl) {
+        pendingRenderUrl = null;
+        setPreviewStatus("settled");
+      }
+    });
+  }
+
+  [liveImg, ghostImg].forEach((img) => {
+    img?.addEventListener("load", () => {
+      if (!state.ui.contentEdit) return;
+      applyLivePreview();
+    });
+  });
+
+  const updateManualFraming = ({ zoom, panX, panY }) => {
+    if (!state.ui.contentEdit) return;
+    const draft = state.ui.contentEdit.draft;
+    draft.zoom = clampNumber(Number(zoom ?? draft.zoom), 1, ZOOM_MAX) ?? draft.zoom;
+    draft.panX = clampNumber(Number(panX ?? draft.panX), -1, 1) ?? draft.panX;
+    draft.panY = clampNumber(Number(panY ?? draft.panY), -1, 1) ?? draft.panY;
+    state.ui.contentEdit.cropMode = "manual";
+    state.ui.contentEdit.dirty = true;
+    state.ui.contentEdit.confirmDiscard = false;
+    syncFramingInputs();
+    applyLiveUpdate();
+  };
+
+  const stopDrag = (pointerId = null) => {
+    if (pointerId !== null && activePointerId !== pointerId) {
+      return;
+    }
+    activePointerId = null;
+    dragState = null;
+    previewStage?.classList.remove("is-dragging");
+  };
+
+  previewFrame?.addEventListener("pointerdown", (event) => {
+    if (!state.ui.contentEdit || state.ui.contentEdit.confirmDiscard || getCropMode() !== "manual") {
+      return;
+    }
+    if (event.button !== 0) {
+      return;
+    }
+    const metrics = getPreviewMetrics(state.ui.contentEdit.draft);
+    if (!metrics) {
+      return;
+    }
+    activePointerId = event.pointerId;
+    dragState = {
+      x: event.clientX,
+      y: event.clientY,
+      panX: state.ui.contentEdit.draft.panX,
+      panY: state.ui.contentEdit.draft.panY,
+      panRangeX: metrics.panRangeX,
+      panRangeY: metrics.panRangeY
+    };
+    previewStage?.classList.add("is-dragging");
+    previewFrame.setPointerCapture?.(event.pointerId);
+    event.preventDefault();
+  });
+
+  previewFrame?.addEventListener("pointermove", (event) => {
+    if (!state.ui.contentEdit || !dragState || event.pointerId !== activePointerId) {
+      return;
+    }
+    event.preventDefault();
+    const deltaX = event.clientX - dragState.x;
+    const deltaY = event.clientY - dragState.y;
+    const nextPanX = dragState.panRangeX > 0
+      ? (clampNumber(dragState.panX + (deltaX / dragState.panRangeX), -1, 1) ?? dragState.panX)
+      : 0;
+    const nextPanY = dragState.panRangeY > 0
+      ? (clampNumber(dragState.panY + (deltaY / dragState.panRangeY), -1, 1) ?? dragState.panY)
+      : 0;
+    updateManualFraming({
+      panX: nextPanX,
+      panY: nextPanY
+    });
+  });
+
+  previewFrame?.addEventListener("pointerup", (event) => {
+    stopDrag(event.pointerId);
+    previewFrame.releasePointerCapture?.(event.pointerId);
+  });
+  previewFrame?.addEventListener("pointercancel", (event) => {
+    stopDrag(event.pointerId);
+  });
+  previewFrame?.addEventListener("lostpointercapture", () => {
+    stopDrag();
+  });
+
+  previewFrame?.addEventListener("wheel", (event) => {
+    if (!state.ui.contentEdit || state.ui.contentEdit.confirmDiscard || getCropMode() !== "manual") {
+      return;
+    }
+    event.preventDefault();
+    const currentZoom = Number(state.ui.contentEdit.draft.zoom) || 1;
+    const nextZoom = clampNumber(currentZoom + (event.deltaY < 0 ? 0.12 : -0.12), 1, ZOOM_MAX);
+    if (nextZoom === null || nextZoom === currentZoom) {
+      return;
+    }
+    updateManualFraming({ zoom: nextZoom });
+  });
+
+  syncCropModeUi();
+  syncValueLabels();
+  applyLivePreview();
+  setPreviewStatus(previewImg && !previewImg.complete ? "rendering" : "settled");
 }
 
 function bindContentSetEditorForm() {

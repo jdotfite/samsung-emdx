@@ -17,14 +17,21 @@ test.describe("Content library", () => {
     expect(dimensionsText.toLowerCase()).toMatch(/portrait|landscape/);
   });
 
-  test("clicking a card opens the preview modal", async ({ page }) => {
+  test("clicking a card selects it and the zoom action opens preview", async ({ page }) => {
     await goToContent(page);
-    await page.locator(".output-card-preview").first().click();
+    const firstCard = page.locator(".output-card").first();
+
+    await firstCard.locator(".output-card-preview").click();
+    await expect(firstCard).toHaveClass(/is-selected/);
+    await expect(page.locator(".modal-shell--preview")).toHaveCount(0);
+
+    await firstCard.locator('[data-action="open-content-preview"]').click();
     await expect(page.locator(".modal-shell--preview")).toBeVisible();
     await expect(page.locator(".modal-shell--preview h2")).toContainText(/fixture-/);
     await page.locator('.modal-shell--preview [data-action="close-content-preview"]').first().click();
     await expect(page.locator(".modal-shell--preview")).toHaveCount(0);
   });
+
 
   test("fit-check warning surfaces on mismatched orientation", async ({ page }) => {
     await goToContent(page);
@@ -47,7 +54,7 @@ test.describe("Content library", () => {
     await expect(page.locator(".modal-shell--edit")).toHaveCount(0);
     await expect(portraitCard.locator(".content-meta-chip--edited")).toBeVisible();
 
-    await page.locator(".output-card", { hasText: "fixture-portrait" }).locator(".output-card-preview").click();
+    await page.locator(".output-card", { hasText: "fixture-portrait" }).locator('[data-action="open-content-preview"]').click();
     await expect(page.locator(".modal-shell--preview")).toBeVisible();
     await expect(page.locator(".modal-shell--preview .content-preview-frame img")).toHaveAttribute("src", /\/api\/content\/items\/.*\/preview\?/);
     await page.locator('[data-action="reset-content-edit"]').click();
@@ -64,6 +71,7 @@ test.describe("Content library", () => {
 
     await expect(page.locator(".content-edit-discard")).toBeVisible();
     await expect(page.locator(".content-edit-discard")).toContainText("Discard unsaved edits?");
+    await expect(page.locator("#content-edit-preview-frame")).toBeVisible();
 
     await page.locator('[data-action="dismiss-content-edit-discard"]').click();
     await expect(page.locator(".content-edit-discard")).toHaveCount(0);
@@ -80,15 +88,47 @@ test.describe("Content library", () => {
 
     const editModal = page.locator(".modal-shell--edit");
     await expect(editModal).toBeVisible();
+    await expect(editModal.locator("[data-content-edit-mode-label]")).toContainText("Quick fit");
     await expect(editModal.getByRole("button", { name: "Quick fit" })).toBeVisible();
     await expect(editModal.getByRole("button", { name: "Manual crop" })).toBeVisible();
     await expect(editModal.locator('select[name="cropAnchor"]')).toBeVisible();
     await expect(editModal.locator('input[name="zoom"]')).toHaveCount(0);
 
     await editModal.getByRole("button", { name: "Manual crop" }).click();
+    await expect(editModal.locator("[data-content-edit-mode-label]")).toContainText("Manual crop");
     await expect(editModal.locator('input[name="zoom"]')).toBeVisible();
     await expect(editModal.getByRole("button", { name: "Reset framing" })).toBeVisible();
     await expect(editModal.locator('select[name="cropAnchor"]')).toHaveCount(0);
+  });
+
+  test("manual crop preview supports drag and wheel framing", async ({ page }) => {
+    await goToContent(page);
+    await page.locator(".output-card", { hasText: "fixture-portrait" }).locator('[data-action="open-content-edit"]').click();
+
+    const editModal = page.locator(".modal-shell--edit");
+    await editModal.getByRole("button", { name: "Manual crop" }).click();
+
+    const frame = page.locator("#content-edit-preview-frame");
+    const zoom = editModal.locator('input[name="zoom"]');
+    const panX = editModal.locator('input[name="panX"]');
+    const panY = editModal.locator('input[name="panY"]');
+    const startZoom = Number(await zoom.inputValue());
+    const box = await frame.boundingBox();
+    expect(box).toBeTruthy();
+
+    await page.mouse.move(box.x + (box.width / 2), box.y + (box.height / 2));
+    await page.mouse.wheel(0, -120);
+    await expect.poll(async () => Number(await zoom.inputValue())).toBeGreaterThan(startZoom);
+
+    await page.mouse.down();
+    await page.mouse.move(box.x + (box.width / 2) + 40, box.y + (box.height / 2) + 20);
+    await page.mouse.up();
+
+    await expect.poll(async () => {
+      const nextPanX = Math.abs(Number(await panX.inputValue()));
+      const nextPanY = Math.abs(Number(await panY.inputValue()));
+      return nextPanX + nextPanY;
+    }).toBeGreaterThan(0);
   });
 
   test("search filters cards by filename", async ({ page }) => {
@@ -154,7 +194,7 @@ test.describe("Content library", () => {
 
     await page.locator('[data-action="toggle-content-manage"]').click();
     await expect(page.locator(".content-set-card", { hasText: "Browse Hint Layout" })).toHaveCount(0);
-    await expect(page.locator(".content-scope-panel--layouts")).toBeVisible();
+    await expect(page.locator(".content-library-panel--browse-summary")).toBeVisible();
     await expect(page.getByRole("button", { name: "Manage Wall Layouts" })).toBeVisible();
   });
 

@@ -39,7 +39,11 @@ export function loadSpotifySettingsFromStore() {
 
 export function saveSpotifySettingsToStore(input = {}) {
   const db = getDb();
-  const settings = normalizeSettings(input);
+  const current = loadSpotifySettingsFromStore();
+  const settings = normalizeSettings({
+    ...input,
+    clientSecret: String(input.clientSecret || "").trim() || current.clientSecret
+  });
 
   db.prepare(`
     INSERT INTO app_state (key, value, updated_at)

@@ -7,6 +7,11 @@ function toAbsolute(relativePath) {
   return path.isAbsolute(relativePath) ? relativePath : path.join(process.cwd(), relativePath);
 }
 
+function toPositiveNumber(value, fallback) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
 export const env = {
   appHost: process.env.APP_HOST || "127.0.0.1",
   appPort: Number(process.env.APP_PORT || 4173),
@@ -16,7 +21,9 @@ export const env = {
   spotifyClientSecret: process.env.SPOTIFY_CLIENT_SECRET || "",
   spotifyMarket: process.env.SPOTIFY_MARKET || "US",
   defaultLocalIp: process.env.DEFAULT_LOCAL_IP || "",
-  samsungEmdxBin: process.env.SAMSUNG_EMDX_BIN || ""
+  samsungEmdxBin: process.env.SAMSUNG_EMDX_BIN || "",
+  appAuthToken: process.env.APP_AUTH_TOKEN || "",
+  contentSchedulePollMs: toPositiveNumber(process.env.CONTENT_SCHEDULE_POLL_MS, 30000)
 };
 
 export function requireSpotifyConfig() {

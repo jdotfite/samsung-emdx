@@ -44,7 +44,7 @@ export function normalizeEditRecipe(input) {
   const fit = FIT_MODES.has(input.fit) ? input.fit : DEFAULT_RECIPE.fit;
   const cropAnchor = CROP_ANCHORS.has(input.cropAnchor) ? input.cropAnchor : DEFAULT_RECIPE.cropAnchor;
   const rotate = ROTATIONS.has(Number(input.rotate)) ? Number(input.rotate) : DEFAULT_RECIPE.rotate;
-  const zoom = clamp(Number(input.zoom), 1, 3) ?? DEFAULT_RECIPE.zoom;
+  const zoom = clamp(Number(input.zoom), 1, 5) ?? DEFAULT_RECIPE.zoom;
   const panX = clamp(Number(input.panX), -1, 1) ?? DEFAULT_RECIPE.panX;
   const panY = clamp(Number(input.panY), -1, 1) ?? DEFAULT_RECIPE.panY;
   const grayscale = Boolean(input.grayscale);
@@ -244,7 +244,15 @@ export async function applyEditRecipe(sourcePath, recipe, { targetWidth, targetH
       }
     }
     if (normalized.sharpen > 0) {
-      pipeline = pipeline.sharpen({ sigma: normalized.sharpen });
+      const sharpenStrength = normalized.sharpen / 5;
+      pipeline = pipeline.sharpen({
+        sigma: 1 + (sharpenStrength * 1.5),
+        m1: 1 + (sharpenStrength * 1.5),
+        m2: 2 + (sharpenStrength * 10),
+        x1: 2,
+        y2: 10 + (sharpenStrength * 18),
+        y3: 20 + (sharpenStrength * 28)
+      });
     }
     if (normalized.blur > 0) {
       pipeline = pipeline.blur(Math.max(0.3, normalized.blur));

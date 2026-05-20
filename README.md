@@ -88,6 +88,8 @@ npm run dev             # starts at http://localhost:4173
 | `DATABASE_PATH` | No | SQLite path (default: `./data/poster-wall.db`) |
 | `DEFAULT_LOCAL_IP` | No | Local IP for Samsung EMDX content serving |
 | `SAMSUNG_EMDX_BIN` | No | Path to samsung-emdx binary |
+| `APP_AUTH_TOKEN` | Recommended for LAN | Optional bearer token required for `/api/*` routes except `/api/health`; the browser prompts for this token on first load |
+| `CONTENT_SCHEDULE_POLL_MS` | No | Schedule poll interval in milliseconds (default: `30000`; lower only for tests) |
 | `APP_PORT` | No | Server port (default: 4173) |
 | `OUTPUT_DIR` | No | Image output directory (default: `./output`) |
 
@@ -126,5 +128,6 @@ Tests use a dedicated SQLite database and fixture images generated via Sharp. Ea
 - Project state is persisted to SQLite. `data/project.json` is a seed/example only.
 - Imported cover art is cached under `assets/covers/imported/`.
 - Edit recipes are non-destructive: the original image is never modified. Derived outputs are cached at `output/.edit-cache/`.
-- The schedule runner polls every 30 seconds. It tracks `lastRunKey` per schedule to avoid duplicate runs within the same time window.
+- The schedule runner polls every 30 seconds by default. It tracks `lastRunKey` per schedule to avoid duplicate runs within the same time window, including failed sends.
+- `APP_AUTH_TOKEN` protects control APIs only. Generated images under `/output/*` remain fetchable so Samsung frames can retrieve content over the LAN.
 - Do not commit `.env` or share Spotify credentials. Rotate secrets before sharing the project.

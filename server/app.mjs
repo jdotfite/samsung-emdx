@@ -70,6 +70,42 @@ function getCurrentLocalMinutes(date = new Date()) {
   return (date.getHours() * 60) + date.getMinutes();
 }
 
+function getLocalScheduleParts(date = new Date(), timeZone = getDefaultTimeZone()) {
+  try {
+    const formatter = new Intl.DateTimeFormat("en-CA", {
+      timeZone: timeZone || getDefaultTimeZone(),
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      weekday: "short",
+      hourCycle: "h23"
+    });
+    const parts = Object.fromEntries(formatter.formatToParts(date).map((part) => [part.type, part.value]));
+    const weekdayIndex = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].indexOf(parts.weekday);
+    return {
+      dateKey: `${parts.year}-${parts.month}-${parts.day}`,
+      minutes: (Number(parts.hour) * 60) + Number(parts.minute),
+      weekday: weekdayIndex >= 0 ? weekdayIndex : date.getDay()
+    };
+  } catch {
+    return {
+      dateKey: createLocalDateKey(date),
+      minutes: getCurrentLocalMinutes(date),
+      weekday: date.getDay()
+    };
+  }
+}
+
+function isScheduleJobStillRunning(schedule) {
+  if (schedule?.lastStatus !== "queued" || !schedule.lastJobId) {
+    return false;
+  }
+  const job = getSendJob(schedule.lastJobId);
+  return job?.status === "queued" || job?.status === "running";
+}
+
 function sortSchedules(a, b) {
   const enabledDiff = Number(Boolean(b.enabled)) - Number(Boolean(a.enabled));
   if (enabledDiff !== 0) {
@@ -309,8 +345,11 @@ function getContentScheduleDueState(schedule, referenceDate = new Date()) {
     if (Number.isNaN(runAt.getTime())) {
       return { due: false, runKey: "", reason: "invalid" };
     }
-    if (schedule.lastRunAt) {
-      return { due: false, runKey: "", reason: "already-ran" };
+    if (["completed", "failed"].includes(schedule.lastStatus) || schedule.enabled === false) {
+      return { due: false, runKey: "", reason: schedule.lastStatus === "failed" ? "failed" : "already-ran" };
+    }
+    if (isScheduleJobStillRunning(schedule)) {
+      return { due: false, runKey: "once", reason: "queued" };
     }
     return {
       due: runAt.getTime() <= referenceDate.getTime(),
@@ -323,12 +362,13 @@ function getContentScheduleDueState(schedule, referenceDate = new Date()) {
     return { due: false, runKey: "", reason: "invalid" };
   }
 
-  const todayKey = createLocalDateKey(referenceDate);
+  const localParts = getLocalScheduleParts(referenceDate, schedule.timeZone);
+  const todayKey = localParts.dateKey;
   if (todayKey < schedule.startDate) {
     return { due: false, runKey: todayKey, reason: "before-start" };
   }
 
-  if (schedule.recurrence === "weekly" && referenceDate.getDay() !== schedule.weekday) {
+  if (schedule.recurrence === "weekly" && localParts.weekday !== schedule.weekday) {
     return { due: false, runKey: todayKey, reason: "wrong-day" };
   }
 
@@ -337,26 +377,31 @@ function getContentScheduleDueState(schedule, referenceDate = new Date()) {
     return { due: false, runKey: todayKey, reason: "invalid" };
   }
 
-  if (schedule.lastRunKey === todayKey) {
-    return { due: false, runKey: todayKey, reason: "already-ran" };
+  if (schedule.lastRunKey === todayKey && ["queued", "completed", "failed"].includes(schedule.lastStatus)) {
+    return {
+      due: false,
+      runKey: todayKey,
+      reason: schedule.lastStatus === "queued" ? "queued" : schedule.lastStatus === "failed" ? "failed" : "already-ran"
+    };
   }
 
-  const currentMinutes = getCurrentLocalMinutes(referenceDate);
   return {
-    due: currentMinutes >= scheduledMinutes,
+    due: localParts.minutes >= scheduledMinutes,
     runKey: todayKey,
-    reason: currentMinutes >= scheduledMinutes ? "ready" : "future"
+    reason: localParts.minutes >= scheduledMinutes ? "ready" : "future"
   };
 }
 
 function createContentScheduleRuntimePatch(schedule, { runKey, jobId = "", status, error = "" }) {
+  const isCompleted = status === "completed";
+  const timestamp = nowIso();
   return {
     ...schedule,
-    enabled: schedule.recurrence === "once" ? false : schedule.enabled,
-    updatedAt: nowIso(),
-    lastRunAt: nowIso(),
+    enabled: schedule.recurrence === "once" && isCompleted ? false : schedule.enabled,
+    updatedAt: timestamp,
+    lastRunAt: isCompleted || status === "failed" ? timestamp : schedule.lastRunAt,
     lastRunKey: runKey || schedule.lastRunKey || "",
-    lastJobId: jobId || "",
+    lastJobId: jobId || schedule.lastJobId || "",
     lastStatus: status,
     lastError: error || ""
   };
@@ -590,11 +635,23 @@ function getContentSetMappingsForProject(project, set, { enabledOnly = false } =
   };
 }
 
-function createSendJobDispatch({ imageName, screens, execute }) {
+function createSendJobDispatch({ imageName, screens, execute, scheduleId = "", runKey = "" }) {
   const job = createSendJob({
     imageName,
     screens
   });
+
+  const updateScheduleAfterJob = ({ status, error = "" }) => {
+    if (!scheduleId) {
+      return;
+    }
+    updateContentScheduleRecord(scheduleId, (current) => createContentScheduleRuntimePatch(current, {
+      runKey,
+      jobId: job.id,
+      status,
+      error
+    }));
+  };
 
   markSendJobRunning(job.id);
 
@@ -614,19 +671,24 @@ function createSendJobDispatch({ imageName, screens, execute }) {
       const finalJob = getSendJob(job.id);
       const hasUnverified = finalJob?.targets.some((target) => target.status === "unverified");
       if (hasUnverified) {
-        failSendJob(job.id, "One or more frames did not confirm image receipt. Try waking the display and sending again.");
+        const message = "One or more frames did not confirm image receipt. Try waking the display and sending again.";
+        failSendJob(job.id, message);
+        updateScheduleAfterJob({ status: "failed", error: message });
       } else {
         finishSendJob(job.id);
+        updateScheduleAfterJob({ status: "completed" });
       }
     } catch (error) {
-      failSendJob(job.id, error.message || "Send failed.");
+      const message = error.message || "Send failed.";
+      failSendJob(job.id, message);
+      updateScheduleAfterJob({ status: "failed", error: message });
     }
   })();
 
   return job;
 }
 
-async function queueImageSend({ project, imageName, screenIds }) {
+async function queueImageSend({ project, imageName, screenIds, scheduleId = "", runKey = "" }) {
   const normalizedName = String(imageName || "").trim();
   if (!normalizedName) {
     throw Object.assign(new Error("imageName is required."), { statusCode: 400 });
@@ -650,6 +712,8 @@ async function queueImageSend({ project, imageName, screenIds }) {
   return createSendJobDispatch({
     imageName: normalizedName,
     screens,
+    scheduleId,
+    runKey,
     execute: ({ onProgress }) => sendImageToScreens({
       screens,
       imagePath,
@@ -658,7 +722,7 @@ async function queueImageSend({ project, imageName, screenIds }) {
   });
 }
 
-async function queueSetSend({ project, setId, screenIds = [] }) {
+async function queueSetSend({ project, setId, screenIds = [], scheduleId = "", runKey = "" }) {
   const normalizedSetId = String(setId || "").trim();
   if (!normalizedSetId) {
     throw Object.assign(new Error("setId is required."), { statusCode: 400 });
@@ -713,6 +777,8 @@ async function queueSetSend({ project, setId, screenIds = [] }) {
   return createSendJobDispatch({
     imageName: `Set: ${set.name}`,
     screens,
+    scheduleId,
+    runKey,
     execute: ({ onProgress }) => sendImagesToScreens({
       screens,
       imagePathByScreenId,
@@ -744,14 +810,25 @@ async function executeDueContentSchedules() {
 
       const project = loadProjectFromStore();
       const job = latest.kind === "set"
-        ? await queueSetSend({ project, setId: latest.setId })
-        : await queueImageSend({ project, imageName: latest.imageName, screenIds: latest.screenIds });
+        ? await queueSetSend({ project, setId: latest.setId, scheduleId: latest.id, runKey: latestDueState.runKey })
+        : await queueImageSend({
+          project,
+          imageName: latest.imageName,
+          screenIds: latest.screenIds,
+          scheduleId: latest.id,
+          runKey: latestDueState.runKey
+        });
 
-      updateContentScheduleRecord(latest.id, (current) => createContentScheduleRuntimePatch(current, {
-        runKey: latestDueState.runKey,
-        jobId: job.id,
-        status: "queued"
-      }));
+      updateContentScheduleRecord(latest.id, (current) => {
+        if (["completed", "failed"].includes(current.lastStatus) && current.lastJobId === job.id) {
+          return current;
+        }
+        return createContentScheduleRuntimePatch(current, {
+          runKey: latestDueState.runKey,
+          jobId: job.id,
+          status: "queued"
+        });
+      });
     } catch (error) {
       updateContentScheduleRecord(schedule.id, (current) => createContentScheduleRuntimePatch(current, {
         runKey: dueState.runKey,
@@ -760,6 +837,15 @@ async function executeDueContentSchedules() {
       }));
     }
   }
+}
+
+function publicSpotifySettings(settings) {
+  return {
+    clientId: settings.clientId,
+    market: settings.market,
+    configured: Boolean(settings.configured),
+    source: settings.source
+  };
 }
 
 export async function startAppServer({ host = env.appHost, port = env.appPort } = {}) {
@@ -781,12 +867,31 @@ export async function startAppServer({ host = env.appHost, port = env.appPort } 
   };
 
   const app = express();
+  app.disable("x-powered-by");
+  app.use((req, res, next) => {
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("Referrer-Policy", "no-referrer");
+    next();
+  });
   app.use(express.json({ limit: "2mb" }));
+  app.use((req, res, next) => {
+    if (!env.appAuthToken || req.path === "/api/health" || !req.path.startsWith("/api/")) {
+      next();
+      return;
+    }
+    const bearer = String(req.headers.authorization || "").replace(/^Bearer\s+/i, "");
+    const token = bearer || String(req.headers["x-app-token"] || "");
+    if (token === env.appAuthToken) {
+      next();
+      return;
+    }
+    res.status(401).json({ error: "Authentication required." });
+  });
 
   void pollDueSchedules();
   setInterval(() => {
     void pollDueSchedules();
-  }, 30000);
+  }, env.contentSchedulePollMs);
 
   app.get("/api/health", (req, res) => {
     res.json({ ok: true });
@@ -917,12 +1022,12 @@ export async function startAppServer({ host = env.appHost, port = env.appPort } 
   });
 
   app.get("/api/studio/plugins/album-art/settings", (req, res) => {
-    res.json(loadSpotifySettingsFromStore());
+    res.json(publicSpotifySettings(loadSpotifySettingsFromStore()));
   });
 
   app.put("/api/studio/plugins/album-art/settings", (req, res) => {
     try {
-      res.json(saveSpotifySettingsToStore(req.body || {}));
+      res.json(publicSpotifySettings(saveSpotifySettingsToStore(req.body || {})));
     } catch (error) {
       res.status(500).json({ error: error.message });
     }
@@ -958,6 +1063,12 @@ export async function startAppServer({ host = env.appHost, port = env.appPort } 
         "image/png": ".png",
         "image/webp": ".webp"
       };
+      const expectedFormatByType = {
+        "image/jpeg": "jpeg",
+        "image/jpg": "jpeg",
+        "image/png": "png",
+        "image/webp": "webp"
+      };
       const extension = extensionByType[contentType];
 
       if (!extension) {
@@ -967,6 +1078,21 @@ export async function startAppServer({ host = env.appHost, port = env.appPort } 
 
       if (!req.body?.length) {
         res.status(400).json({ error: "No image data received." });
+        return;
+      }
+
+      try {
+        const metadata = await sharp(req.body, { limitInputPixels: 40_000_000 }).metadata();
+        if (!metadata.width || !metadata.height || !["jpeg", "png", "webp"].includes(metadata.format)) {
+          res.status(400).json({ error: "Invalid or unsupported image data." });
+          return;
+        }
+        if (metadata.format !== expectedFormatByType[contentType]) {
+          res.status(400).json({ error: "Image bytes do not match the declared content type." });
+          return;
+        }
+      } catch {
+        res.status(400).json({ error: "Invalid or unsupported image data." });
         return;
       }
 
@@ -1442,7 +1568,9 @@ export async function startAppServer({ host = env.appHost, port = env.appPort } 
 
   app.use("/assets", express.static(path.join(rootDir, "assets"), { etag: false, maxAge: 0 }));
   app.use("/src", express.static(path.join(rootDir, "src"), { etag: false, maxAge: 0 }));
-  app.use("/data", express.static(path.join(rootDir, "data"), { etag: false, maxAge: 0 }));
+  app.use("/data", (req, res) => {
+    res.status(404).json({ error: "Not found" });
+  });
   app.use("/output", express.static(outputDir, { etag: false, maxAge: 0 }));
 
   app.get(/.*/, (req, res) => {
