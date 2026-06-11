@@ -25,6 +25,15 @@ export async function apiPutJson(url, body) {
   return parseJson(response);
 }
 
+export async function apiPatchJson(url, body) {
+  const response = await fetch(url, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json", Accept: "application/json", ...getApiAuthHeaders() },
+    body: JSON.stringify(body)
+  });
+  return parseJson(response);
+}
+
 export async function apiDeleteJson(url) {
   const response = await fetch(url, {
     method: "DELETE",

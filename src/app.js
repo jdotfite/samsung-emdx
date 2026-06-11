@@ -1,4 +1,4 @@
-import { apiDeleteJson, apiGetJson, apiPostJson, apiPutJson, apiUploadImage, saveApiAuthToken } from "./api.js";
+import { apiDeleteJson, apiGetJson, apiPatchJson, apiPostJson, apiPutJson, apiUploadImage, saveApiAuthToken } from "./api.js";
 import { DEFAULT_PROJECT } from "./default-project.js";
 import { getStudioPluginById, STUDIO_PLUGINS } from "./plugin-registry.js";
 import { getTemplateById, TEMPLATE_REGISTRY } from "./template-registry.js";
@@ -42,6 +42,12 @@ const state = {
     contentScreenId: null,
     contentBroadcastIds: [],
     contentSelectedImage: "",
+    contentSendPickerImage: "",
+    contentRenameImage: "",
+    contentCreateSetDialog: false,
+    nowPlaying: null,
+    screenImages: {},
+    playNowDialog: null,
     contentReplaceImage: "",
     contentLibraryFilter: "all",
     contentLibrarySearch: "",
@@ -97,6 +103,26 @@ const state = {
       quickQuery: "",
       quickRun: null
     }
+  },
+  tmdb: {
+    genres: [],
+    query: "",
+    genreId: "",
+    sortBy: "popularity.desc",
+    yearGte: "",
+    yearLte: "",
+    page: 1,
+    totalPages: 1,
+    results: [],
+    loading: false,
+    error: "",
+    importing: {},
+    importedNames: [],
+    quickQuery: "",
+    quickGenreId: "",
+    quickIntervalMinutes: 60,
+    quickScreenIds: null,
+    quickRun: null
   }
 };
 
@@ -161,6 +187,7 @@ async function init() {
   state.spotifySettings = normalizeSpotifySettings(spotifySettings);
   state.contentSchedules = normalizeContentSchedules(contentSchedules);
   applyStoredUiState();
+  startAmbientTimer();
   const initialSlugs = new Set(state.project.screens.map((screen) => screen.albumSlug).filter(Boolean));
   if (state.ui.section === "studio" && state.ui.studioView === "workspace" && state.ui.studioPluginId === "album-art-generator") {
     state.catalog.forEach((entry) => initialSlugs.add(entry.slug));
@@ -263,8 +290,36 @@ function normalizeProject(project) {
     contentLibrary,
     rooms: [...normalizedRooms.values()],
     walls: [...normalizedWalls.values()],
-    screens
+    screens,
+    ambient: normalizeAmbient(project.ambient || {}),
+    tmdbAuto: normalizeTmdbAuto(project.tmdbAuto || {})
   };
+}
+
+function normalizeTmdbAuto(raw = {}) {
+  return {
+    screenIds: Array.isArray(raw.screenIds) ? raw.screenIds.map(String) : [],
+    intervalMinutes: Number.isFinite(Number(raw.intervalMinutes)) && Number(raw.intervalMinutes) > 0 ? Number(raw.intervalMinutes) : 60,
+    enabled: Boolean(raw.enabled),
+    lastRotatedAt: raw.lastRotatedAt || null
+  };
+}
+
+function normalizeAmbientConfig(raw = {}) {
+  return {
+    collectionId: String(raw.collectionId || "all"),
+    intervalMinutes: Number.isFinite(Number(raw.intervalMinutes)) ? Number(raw.intervalMinutes) : 90,
+    enabled: Boolean(raw.enabled),
+    lastRotatedAt: raw.lastRotatedAt || null
+  };
+}
+
+function normalizeAmbient(raw = {}) {
+  const out = {};
+  for (const [roomId, config] of Object.entries(raw)) {
+    out[roomId] = normalizeAmbientConfig(config);
+  }
+  return out;
 }
 
 async function loadCatalog() {
@@ -696,7 +751,7 @@ function stopSendFlowPolling() {
 function createPendingSendFlow({ imageName, targetNames }) {
   return {
     active: true,
-    minimized: false,
+    minimized: true,
     jobId: "",
     imageName,
     targetNames,
@@ -948,7 +1003,10 @@ function resetContentUi() {
   state.ui.contentScreenId = null;
   state.ui.contentBroadcastIds = [];
   state.ui.contentSelectedImage = "";
+  state.ui.contentSendPickerImage = "";
+  state.ui.contentRenameImage = "";
   state.ui.contentReplaceImage = "";
+  state.ui.contentCreateSetDialog = false;
   state.ui.contentLibraryFilter = "all";
   state.ui.contentManageMode = false;
   state.ui.contentManageSelections = [];
@@ -1418,7 +1476,8 @@ function getContentImageMeta(imageName) {
     collectionIds: Array.isArray(meta.collectionIds) ? meta.collectionIds : [],
     editRecipe: meta.editRecipe || null,
     favorite: Boolean(meta.favorite),
-    lastSentAt: meta.lastSentAt || ""
+    lastSentAt: meta.lastSentAt || "",
+    displayName: meta.displayName || ""
   };
 }
 
@@ -1456,7 +1515,8 @@ function getEnrichedOutputImages() {
       setMembership: memberships.get(image.name) || null,
       editRecipe: meta.editRecipe || null,
       favorite: meta.favorite,
-      lastSentAt: meta.lastSentAt || ""
+      lastSentAt: meta.lastSentAt || "",
+      displayName: meta.displayName || ""
     };
   });
 }
@@ -1879,6 +1939,155 @@ function getGroupedScreens() {
     }));
 }
 
+function getScreensForRoom(roomId) {
+  const room = getGroupedScreens().find((r) => r.id === roomId);
+  if (!room) return [];
+  return room.walls.flatMap((w) => w.screens).filter((s) => s.enabled);
+}
+
+function getImagesForPlaySource(collectionId) {
+  const images = getEnrichedOutputImages();
+  if (!collectionId || collectionId === "all") return images;
+  return images.filter((img) => img.contentMeta.collectionIds.includes(collectionId));
+}
+
+async function rotateRoom(roomId) {
+  const nowPlaying = state.ui.nowPlaying?.roomId === roomId ? state.ui.nowPlaying : null;
+  const ambientConfig = state.project.ambient?.[roomId];
+  const sourceCollectionId = nowPlaying ? nowPlaying.collectionId : (ambientConfig?.collectionId || "all");
+
+  const screens = getScreensForRoom(roomId);
+  if (!screens.length) return { sent: 0, total: 0 };
+
+  const allImages = getImagesForPlaySource(sourceCollectionId);
+  if (!allImages.length) return { sent: 0, total: screens.length };
+
+  const currentlyShowing = new Set(
+    screens.map((s) => state.ui.screenImages[s.id]).filter(Boolean)
+  );
+  let pool = allImages.filter((img) => !currentlyShowing.has(img.name));
+  if (!pool.length) pool = [...allImages];
+
+  const shuffled = [...pool].sort(() => Math.random() - 0.5);
+
+  const usedInRotation = new Set();
+  const assignments = screens.map((screen) => {
+    const img = shuffled.find((i) => !usedInRotation.has(i.name));
+    if (img) usedInRotation.add(img.name);
+    return { screen, image: img || null };
+  }).filter((a) => a.image);
+
+  const results = await Promise.allSettled(
+    assignments.map(async ({ screen, image }) => {
+      const payload = await apiPostJson("/api/content/send", {
+        imageName: image.name,
+        screenIds: [screen.id]
+      });
+      state.ui.screenImages[screen.id] = image.name;
+      return payload;
+    })
+  );
+
+  const sent = results.filter((r) => r.status === "fulfilled").length;
+  return { sent, total: assignments.length };
+}
+
+async function rotateTmdbAuto() {
+  const { tmdbAuto } = state.project;
+  if (!tmdbAuto?.enabled || !tmdbAuto.screenIds?.length) return { sent: 0, total: 0 };
+  const screens = (state.project.screens || []).filter((s) => s.enabled && tmdbAuto.screenIds.includes(s.id));
+  if (!screens.length) return { sent: 0, total: 0 };
+  const images = getImagesForPlaySource("tmdb-auto");
+  if (!images.length) return { sent: 0, total: screens.length };
+  const currentlyShowing = new Set(screens.map((s) => state.ui.screenImages[s.id]).filter(Boolean));
+  let pool = images.filter((img) => !currentlyShowing.has(img.name));
+  if (!pool.length) pool = [...images];
+  const shuffled = [...pool].sort(() => Math.random() - 0.5);
+  const used = new Set();
+  const assignments = screens.map((screen) => {
+    const img = shuffled.find((i) => !used.has(i.name));
+    if (img) used.add(img.name);
+    return { screen, image: img || null };
+  }).filter((a) => a.image !== null);
+  const results = await Promise.allSettled(
+    assignments.filter((a) => a.image).map(({ screen, image }) =>
+      apiPostJson("/api/content/send", { imageName: image.name, screenIds: [screen.id] }).then((payload) => {
+        state.ui.screenImages[screen.id] = image.name;
+        return payload;
+      })
+    )
+  );
+  return { sent: results.filter((r) => r.status === "fulfilled").length, total: assignments.length };
+}
+
+async function endNowPlaying() {
+  if (!state.ui.nowPlaying) return;
+  const { snapshotImages, roomId } = state.ui.nowPlaying;
+  state.ui.nowPlaying = null;
+  if (snapshotImages && Object.keys(snapshotImages).length) {
+    await Promise.allSettled(
+      Object.entries(snapshotImages).map(async ([screenId, imageName]) => {
+        if (!imageName) return;
+        await apiPostJson("/api/content/send", { imageName, screenIds: [screenId] });
+        state.ui.screenImages[screenId] = imageName;
+      })
+    );
+    state.actions.notice = "Now Playing ended — screens restored.";
+  }
+  renderWorkspace();
+}
+
+let ambientTimer = null;
+
+function startAmbientTimer() {
+  if (ambientTimer) clearInterval(ambientTimer);
+  ambientTimer = setInterval(checkAmbientRotations, 60_000);
+}
+
+async function checkAmbientRotations() {
+  const now = Date.now();
+
+  if (state.ui.nowPlaying?.endAt) {
+    if (now >= new Date(state.ui.nowPlaying.endAt).getTime()) {
+      await endNowPlaying();
+      return;
+    }
+  }
+
+  const ambient = state.project.ambient || {};
+  for (const [roomId, config] of Object.entries(ambient)) {
+    if (!config.enabled || !config.intervalMinutes) continue;
+    const isNowPlaying = state.ui.nowPlaying?.roomId === roomId;
+    const lastRotatedAt = isNowPlaying
+      ? (state.ui.nowPlaying.lastRotatedAt || null)
+      : config.lastRotatedAt;
+    const intervalMs = config.intervalMinutes * 60_000;
+    const lastMs = lastRotatedAt ? new Date(lastRotatedAt).getTime() : 0;
+    if (now - lastMs >= intervalMs) {
+      await rotateRoom(roomId);
+      const ts = new Date().toISOString();
+      if (isNowPlaying) {
+        state.ui.nowPlaying.lastRotatedAt = ts;
+      } else {
+        state.project.ambient[roomId].lastRotatedAt = ts;
+        persistProject();
+      }
+      renderWorkspace();
+    }
+  }
+
+  const { tmdbAuto } = state.project;
+  if (tmdbAuto?.enabled && tmdbAuto.screenIds?.length) {
+    const lastMs = tmdbAuto.lastRotatedAt ? new Date(tmdbAuto.lastRotatedAt).getTime() : 0;
+    if (now - lastMs >= tmdbAuto.intervalMinutes * 60_000) {
+      await rotateTmdbAuto();
+      state.project.tmdbAuto.lastRotatedAt = new Date().toISOString();
+      persistProject();
+      renderWorkspace();
+    }
+  }
+}
+
 function getWallSlotOccupancy(wall) {
   const slots = new Map();
   wall.screens.forEach((screen) => {
@@ -2018,6 +2227,17 @@ function createToastLayer() {
   `;
 }
 
+function formatRelativeTime(isoString) {
+  if (!isoString) return "never";
+  const diffMs = Date.now() - new Date(isoString).getTime();
+  const mins = Math.floor(diffMs / 60_000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins} min ago`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs}h ago`;
+  return `${Math.floor(hrs / 24)}d ago`;
+}
+
 function formatBytes(value) {
   if (!value) {
     return "0 B";
@@ -2037,6 +2257,7 @@ function createSectionTabs() {
   const sections = [
     { id: "devices", label: "Devices" },
     { id: "content", label: "Content" },
+    { id: "play", label: "Play" },
     { id: "studio", label: "Studio" }
   ];
 
@@ -2166,6 +2387,25 @@ function iconSvg(type) {
         <path d="m12 18-5-5" />
         <path d="m12 18 5-5" />
         <path d="M12 6v12" />
+      </svg>
+    `,
+    trash: `
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M3 6h18" />
+        <path d="M8 6V4h8v2" />
+        <path d="M19 6l-1 14H6L5 6" />
+      </svg>
+    `,
+    send: `
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M5 12h14" />
+        <path d="m12 5 7 7-7 7" />
+      </svg>
+    `,
+    rename: `
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" />
+        <path d="M18.5 2.5a2.12 2.12 0 0 1 3 3L12 15l-4 1 1-4Z" />
       </svg>
     `,
   };
@@ -2443,10 +2683,10 @@ function createOutputImageCard(image) {
     image.editRecipe ? `<span class="content-meta-chip content-meta-chip--edited">Edited</span>` : "",
     image.favorite ? `<span class="content-meta-chip content-meta-chip--favorite">★</span>` : ""
   ].filter(Boolean);
-  const dimensionsLine = formatImageDimensions(image);
-  const metaLine = dimensionsLine
-    ? `${dimensionsLine} · ${formatBytes(image.size)}`
-    : `${formatDateTime(image.modifiedAt)} · ${formatBytes(image.size)}`;
+  const resolution = image.width && image.height ? `${image.width}×${image.height}` : "";
+  const format = image.format ? String(image.format).toUpperCase() : "";
+  const fileSize = Number.isFinite(image.size) ? formatBytes(image.size) : "";
+  const displayLabel = safeText(image.displayName || image.name.replace(/^(\d+-)+/, "") || image.name);
   const previewImageUrl = image.editRecipe
     ? buildSavedContentPreviewUrl(image)
     : `${image.url}?t=${encodeURIComponent(image.modifiedAt)}`;
@@ -2455,44 +2695,6 @@ function createOutputImageCard(image) {
       class="output-card ${isSelected ? "is-selected" : ""} ${isManageMode ? "is-manage-mode" : ""}"
       data-image-name="${imageNameAttr}"
     >
-      ${
-        !isManageMode
-          ? `
-            <div class="output-card-actions">
-              <button
-                type="button"
-                class="icon-button icon-button--ghost icon-button--small ${image.favorite ? "is-favorite" : ""}"
-                data-action="toggle-content-favorite"
-                data-image-name="${imageNameAttr}"
-                aria-label="${image.favorite ? "Unfavorite" : "Favorite"} ${imageNameAttr}"
-                title="${image.favorite ? "Unfavorite" : "Favorite"}"
-              >
-                ${image.favorite ? "★" : "☆"}
-              </button>
-              <button
-                type="button"
-                class="icon-button icon-button--ghost icon-button--small"
-                data-action="open-content-edit"
-                data-image-name="${imageNameAttr}"
-                aria-label="Edit ${imageNameAttr}"
-                title="Edit image"
-              >
-                ${iconSvg("edit")}
-              </button>
-              <button
-                type="button"
-                class="icon-button icon-button--ghost icon-button--small"
-                data-action="open-content-preview"
-                data-image-name="${imageNameAttr}"
-                aria-label="Preview ${imageNameAttr}"
-                title="Preview image"
-              >
-                ${iconSvg("zoom")}
-              </button>
-            </div>
-          `
-          : ""
-      }
       <button
         type="button"
         class="output-card-preview"
@@ -2509,12 +2711,64 @@ function createOutputImageCard(image) {
         data-action="select-content-image"
         data-image-name="${imageNameAttr}"
       >
-        <strong>${imageName}</strong>
-        <span>${safeText(metaLine)}</span>
-        ${badges.length ? `<div class="content-meta-row">${badges.join("")}</div>` : ""}
+        <strong title="${safeAttr(image.displayName || image.name)}">${displayLabel}</strong>
       </button>
+      ${resolution || format || fileSize ? `
+        <div class="output-card-meta">
+          <span>${safeText(resolution)}</span>
+          <span>${safeText(format)}</span>
+          <span>${safeText(fileSize)}</span>
+        </div>
+      ` : ""}
+      ${badges.length ? `<div class="content-meta-row">${badges.join("")}</div>` : ""}
+      ${!isManageMode ? `
+        <div class="output-card-actions">
+          <button
+            type="button"
+            class="icon-button icon-button--ghost icon-button--small ${image.favorite ? "is-favorite" : ""}"
+            data-action="toggle-content-favorite"
+            data-image-name="${imageNameAttr}"
+            aria-label="${image.favorite ? "Unfavorite" : "Favorite"} ${imageNameAttr}"
+            title="${image.favorite ? "Unfavorite" : "Favorite"}"
+          >${image.favorite ? "★" : "☆"}</button>
+          <button
+            type="button"
+            class="icon-button icon-button--ghost icon-button--small"
+            data-action="open-content-edit"
+            data-image-name="${imageNameAttr}"
+            title="Edit image"
+          >${iconSvg("edit")}</button>
+          <button
+            type="button"
+            class="icon-button icon-button--ghost icon-button--small"
+            data-action="open-content-preview"
+            data-image-name="${imageNameAttr}"
+            title="Preview"
+          >${iconSvg("zoom")}</button>
+          <button
+            type="button"
+            class="icon-button icon-button--ghost icon-button--small output-card-send-btn"
+            data-action="open-content-send-picker"
+            data-image-name="${imageNameAttr}"
+            title="Send to frame"
+          >${iconSvg("send")}</button>
+        </div>
+      ` : ""}
     </article>
   `;
+}
+
+function createCollectionFilterChips() {
+  const summary = getContentCollectionSummaries();
+  if (!summary.collections.length) return "";
+  const chips = [
+    `<button type="button" class="content-filter-chip ${state.ui.contentLibraryFilter === "all" ? "is-selected" : ""}" data-action="filter-content-library" data-filter="all"><strong>All</strong><span>${summary.total}</span></button>`,
+    ...summary.collections.map((collection) => {
+      const isSelected = state.ui.contentLibraryFilter === `collection:${collection.id}`;
+      return `<button type="button" class="content-filter-chip ${isSelected ? "is-selected" : ""}" data-action="filter-content-library" data-filter="collection:${safeAttr(collection.id)}"><strong>${safeText(collection.name)}</strong><span>${collection.count}</span></button>`;
+    })
+  ].join("");
+  return `<div class="content-library-toolbar-collections content-filter-row">${chips}</div>`;
 }
 
 function createContentBrowseCollectionsPanel() {
@@ -2522,59 +2776,20 @@ function createContentBrowseCollectionsPanel() {
   const activeCollection = getActiveContentCollection();
   const scheduleCount = state.contentSchedules.length;
   const setCount = getContentLibrary().sets.length;
-  const totalCount = summary.total;
   const visibleCount = getVisibleOutputImages().length;
-  const collectionChips = [
-    `
-      <button
-        type="button"
-        class="content-filter-chip ${state.ui.contentLibraryFilter === "all" ? "is-selected" : ""}"
-        data-action="filter-content-library"
-        data-filter="all"
-      >
-        <strong>All Posters</strong>
-        <span>${summary.total} image${summary.total === 1 ? "" : "s"}</span>
-      </button>
-    `,
-    ...summary.collections.map((collection) => {
-      const isSelected = state.ui.contentLibraryFilter === `collection:${collection.id}`;
-      const collectionId = safeAttr(collection.id);
-      const collectionName = safeText(collection.name);
-      return `
-        <button
-          type="button"
-          class="content-filter-chip ${isSelected ? "is-selected" : ""}"
-          data-action="filter-content-library"
-          data-filter="collection:${collectionId}"
-        >
-          <strong>${collectionName}</strong>
-          <span>${collection.count} image${collection.count === 1 ? "" : "s"}</span>
-        </button>
-      `;
-    })
-  ].join("");
-  const focusTitle = activeCollection ? activeCollection.name : "All Posters";
+  const totalCount = summary.total;
   const focusCopy = activeCollection
-    ? `${visibleCount} image${visibleCount === 1 ? "" : "s"} in this collection. Pick one to preview, send, or schedule.`
-    : `${totalCount} poster${totalCount === 1 ? "" : "s"} ready. Pick a poster first, then preview it, send it, or schedule it.`;
+    ? `${visibleCount} image${visibleCount === 1 ? "" : "s"} in this collection.`
+    : `${totalCount} poster${totalCount === 1 ? "" : "s"} in library.`;
   return `
     <section class="content-library-panel content-library-panel--browse content-library-panel--browse-summary">
       <div class="content-library-row content-library-row--browse-summary">
         <div class="content-library-copy">
-          <span class="device-summary-kicker">Poster Library</span>
-          <strong>${safeText(focusTitle)}</strong>
           <span>${safeText(focusCopy)}</span>
         </div>
         <div class="content-browse-summary-actions">
-          ${activeCollection ? `<button type="button" class="secondary" data-action="filter-content-library" data-filter="all">View All Posters</button>` : ""}
-          <button type="button" class="secondary" data-action="open-content-manage">Manage Wall Layouts${setCount ? `<span class="content-action-badge" aria-hidden="true">${setCount}</span>` : ""}</button>
-          <button type="button" class="secondary" data-action="open-content-automation">Manage Schedules${scheduleCount ? `<span class="content-action-badge" aria-hidden="true">${scheduleCount}</span>` : ""}</button>
-        </div>
-      </div>
-      <div class="content-browse-collection-strip">
-        <span class="content-browse-strip-label">Collections</span>
-        <div class="content-filter-row content-filter-row--browse">
-          ${collectionChips}
+          <button type="button" class="secondary" data-action="open-content-manage">Wall Layouts${setCount ? `<span class="content-action-badge" aria-hidden="true">${setCount}</span>` : ""}</button>
+          <button type="button" class="secondary" data-action="open-content-automation">Schedules${scheduleCount ? `<span class="content-action-badge" aria-hidden="true">${scheduleCount}</span>` : ""}</button>
         </div>
       </div>
     </section>
@@ -2970,40 +3185,44 @@ function createContentBrowseToolbar() {
   const visibleCount = getVisibleOutputImages().length;
   const favoriteCount = getEnrichedOutputImages().filter((image) => image.favorite).length;
   const hasFilter = filter !== "all" || Boolean(query);
+  const collectionChips = createCollectionFilterChips();
   return `
     <div class="content-library-toolbar">
-      <div class="content-library-toolbar-search">
-        <span class="content-library-toolbar-label">Search</span>
-        <div class="content-library-toolbar-search-field">
-          <input
-            id="content-library-search"
-            type="search"
-            placeholder="Search by name, tag, collection, orientation"
-            value="${query.replace(/"/g, "&quot;")}"
-            autocomplete="off"
-            spellcheck="false"
-          />
-          ${query ? `<button type="button" class="content-library-toolbar-clear" data-action="clear-content-library-search" aria-label="Clear search">×</button>` : ""}
+      <div class="content-library-toolbar-row">
+        <div class="content-library-toolbar-search">
+          <span class="content-library-toolbar-label">Search</span>
+          <div class="content-library-toolbar-search-field">
+            <input
+              id="content-library-search"
+              type="search"
+              placeholder="Search by name, tag, collection, orientation"
+              value="${query.replace(/"/g, "&quot;")}"
+              autocomplete="off"
+              spellcheck="false"
+            />
+            ${query ? `<button type="button" class="content-library-toolbar-clear" data-action="clear-content-library-search" aria-label="Clear search">×</button>` : ""}
+          </div>
+        </div>
+        <div class="content-library-toolbar-controls">
+          <label class="content-library-toolbar-sort">
+            <span class="content-library-toolbar-label">Sort</span>
+            <select id="content-library-sort">
+              <option value="recent" ${sortKey === "recent" ? "selected" : ""}>Newest first</option>
+              <option value="oldest" ${sortKey === "oldest" ? "selected" : ""}>Oldest first</option>
+              <option value="name-asc" ${sortKey === "name-asc" ? "selected" : ""}>Name A→Z</option>
+              <option value="name-desc" ${sortKey === "name-desc" ? "selected" : ""}>Name Z→A</option>
+              <option value="largest" ${sortKey === "largest" ? "selected" : ""}>Largest resolution</option>
+              <option value="smallest" ${sortKey === "smallest" ? "selected" : ""}>Smallest resolution</option>
+              <option value="recently-edited" ${sortKey === "recently-edited" ? "selected" : ""}>Recently edited</option>
+              <option value="recently-sent" ${sortKey === "recently-sent" ? "selected" : ""}>Recently sent</option>
+            </select>
+          </label>
+          ${favoriteCount ? `<button type="button" class="content-library-toolbar-filter-chip ${filter === "favorites" ? "is-selected" : ""}" data-action="filter-content-library" data-filter="${filter === "favorites" ? "all" : "favorites"}">★ ${favoriteCount}</button>` : ""}
+          <span class="content-library-toolbar-count">${visibleCount} of ${totalCount}</span>
+          ${hasFilter ? `<button type="button" class="content-library-toolbar-reset" data-action="reset-content-library-filters">Reset</button>` : ""}
         </div>
       </div>
-      <div class="content-library-toolbar-controls">
-        <label class="content-library-toolbar-sort">
-          <span class="content-library-toolbar-label">Sort</span>
-          <select id="content-library-sort">
-            <option value="recent" ${sortKey === "recent" ? "selected" : ""}>Newest first</option>
-            <option value="oldest" ${sortKey === "oldest" ? "selected" : ""}>Oldest first</option>
-            <option value="name-asc" ${sortKey === "name-asc" ? "selected" : ""}>Name A→Z</option>
-            <option value="name-desc" ${sortKey === "name-desc" ? "selected" : ""}>Name Z→A</option>
-            <option value="largest" ${sortKey === "largest" ? "selected" : ""}>Largest resolution</option>
-            <option value="smallest" ${sortKey === "smallest" ? "selected" : ""}>Smallest resolution</option>
-            <option value="recently-edited" ${sortKey === "recently-edited" ? "selected" : ""}>Recently edited</option>
-            <option value="recently-sent" ${sortKey === "recently-sent" ? "selected" : ""}>Recently sent</option>
-          </select>
-        </label>
-        ${favoriteCount ? `<button type="button" class="content-library-toolbar-filter-chip ${filter === "favorites" ? "is-selected" : ""}" data-action="filter-content-library" data-filter="${filter === "favorites" ? "all" : "favorites"}">★ ${favoriteCount}</button>` : ""}
-        <span class="content-library-toolbar-count">${visibleCount} of ${totalCount}</span>
-        ${hasFilter ? `<button type="button" class="content-library-toolbar-reset" data-action="reset-content-library-filters">Reset</button>` : ""}
-      </div>
+      ${collectionChips}
     </div>
   `;
 }
@@ -3025,8 +3244,7 @@ function createContentManagePanel() {
             <button type="button" data-action="create-content-collection">Create Collection</button>
           </div>
           <div class="spotify-search-row manage-search-row content-library-create-row">
-            <input id="content-set-name" type="text" placeholder="Create ordered set from selection, like Triptych" />
-            <button type="button" data-action="create-content-set" ${selectedCount >= 2 ? "" : "disabled"}>Create Set${selectedCount >= 2 ? ` (${selectedCount})` : ""}</button>
+            <button type="button" data-action="open-create-set-dialog" ${selectedCount >= 2 ? "" : "disabled"} style="width:100%">Create Set${selectedCount >= 2 ? ` (${selectedCount})` : ""}</button>
           </div>
         </div>
       </div>
@@ -3088,8 +3306,6 @@ function createContentManagePanel() {
           <button type="button" class="secondary" data-action="clear-content-collections" ${selectedCount ? "" : "disabled"}>Clear Collections</button>
         </div>
       </div>
-      ${createContentSetsPanel({ showEmpty: true })}
-      ${createContentSchedulesPanel({ showEmpty: true })}
     </section>
   `;
 }
@@ -3108,6 +3324,64 @@ function createTargetDeviceButton(screen) {
       <strong>${safeText(screen.name)}</strong>
       <span>${safeText(screen.device.host || "No host")}</span>
     </button>
+  `;
+}
+
+function createContentCreateSetDialog() {
+  if (!state.ui.contentCreateSetDialog) return "";
+  const count = state.ui.contentManageSelections.length;
+  return `
+    <div class="send-picker-backdrop" data-action="cancel-create-set-dialog"></div>
+    <div class="send-picker" role="dialog" aria-label="Name your set">
+      <div class="send-picker-header">
+        <span class="send-picker-title">Name your set</span>
+        <button type="button" class="icon-button icon-button--ghost icon-button--small" data-action="cancel-create-set-dialog" aria-label="Close">${iconSvg("close")}</button>
+      </div>
+      <div class="send-picker-body">
+        <input
+          id="create-set-name-input"
+          type="text"
+          class="create-set-name-input"
+          placeholder="e.g. Triptych, Living Room Wall…"
+          autocomplete="off"
+          spellcheck="false"
+        />
+      </div>
+      <div class="send-picker-footer">
+        <button type="button" class="secondary" data-action="cancel-create-set-dialog">Cancel</button>
+        <button type="button" data-action="confirm-create-set">Create Set (${count})</button>
+      </div>
+    </div>
+  `;
+}
+
+function createContentSendPicker() {
+  const imageName = state.ui.contentSendPickerImage;
+  if (!imageName) return "";
+  const screens = state.project.screens.filter((s) => s.enabled);
+  return `
+    <div class="send-picker-backdrop" data-action="close-content-send-picker"></div>
+    <div class="send-picker" role="dialog" aria-label="Send to frame">
+      <div class="send-picker-header">
+        <span class="send-picker-title">Send to frame</span>
+        <button type="button" class="icon-button icon-button--ghost icon-button--small" data-action="close-content-send-picker" aria-label="Close">${iconSvg("close")}</button>
+      </div>
+      <div class="send-picker-name">${safeText(imageName)}</div>
+      <div class="send-picker-devices">
+        ${screens.map((screen) => `
+          <button
+            type="button"
+            class="send-picker-device"
+            data-action="send-content-to-screen"
+            data-image-name="${safeAttr(imageName)}"
+            data-screen-id="${safeAttr(screen.id)}"
+          >
+            <strong>${safeText(screen.name)}</strong>
+            <span>${safeText(screen.device.host || "No host")}</span>
+          </button>
+        `).join("")}
+      </div>
+    </div>
   `;
 }
 
@@ -3134,20 +3408,17 @@ function createContentActionBar() {
   }
 
   const selectedImage = state.outputImages.find((image) => image.name === state.ui.contentSelectedImage) || null;
-  const targetScreens = getContentTargetScreens();
+  if (!selectedImage) return "";
   return `
     <div class="content-action-bar">
       <div class="content-footer-copy">
-        <span class="device-summary-kicker">Selection</span>
-        <strong>${selectedImage ? safeText(selectedImage.name) : "No image selected"}</strong>
-        <span>${targetScreens.length ? safeText(targetScreens.map((screen) => screen.name).join(", ")) : "No target devices selected"}</span>
+        <span class="device-summary-kicker">Selected</span>
+        <strong>${safeText(selectedImage.name)}</strong>
       </div>
       <div class="content-footer-actions">
-        <button type="button" class="secondary" data-action="cancel-content">Cancel</button>
-        <button type="button" class="secondary" ${selectedImage ? "" : "disabled"} data-action="delete-content">Delete</button>
-        <button type="button" class="secondary" ${selectedImage ? "" : "disabled"} data-action="replace-content">Replace</button>
-        <button type="button" class="secondary" ${selectedImage && targetScreens.length ? "" : "disabled"} data-action="open-selected-content-schedule">Schedule</button>
-        <button type="button" ${selectedImage && targetScreens.length ? "" : "disabled"} data-action="send-content">Send</button>
+        <button type="button" class="secondary" data-action="cancel-content">${iconSvg("close")} Cancel</button>
+        <button type="button" class="secondary" data-action="delete-content">${iconSvg("trash")} Delete</button>
+        <button type="button" data-action="open-content-send-picker" data-image-name="${safeAttr(selectedImage.name)}">Send to Frame ${iconSvg("send")}</button>
       </div>
     </div>
   `;
@@ -3991,6 +4262,224 @@ function renderAlbumArtWorkspace() {
   `;
 }
 
+function renderTmdbIntervalOptions(selectedMinutes) {
+  return [
+    { v: 30, l: "30 min" }, { v: 60, l: "1 hour" }, { v: 120, l: "2 hours" },
+    { v: 240, l: "4 hours" }, { v: 480, l: "8 hours" }, { v: 1440, l: "24 hours" }
+  ].map(o => `<option value="${o.v}" ${selectedMinutes === o.v ? "selected" : ""}>${o.l}</option>`).join("");
+}
+
+function renderTmdbScreenPicker(selectedIds, disabled = false) {
+  const screens = (state.project?.screens || []).filter((s) => s.enabled);
+  if (!screens.length) return `<p class="tmdb-no-screens">No enabled frames found.</p>`;
+  return `
+    <div class="tmdb-screen-picker">
+      ${screens.map(s => {
+        const checked = selectedIds.includes(s.id);
+        return `
+          <label class="tmdb-screen-chip ${checked ? "is-checked" : ""} ${disabled ? "is-disabled" : ""}">
+            <input type="checkbox" class="tmdb-screen-checkbox" data-screen-id="${safeAttr(s.id)}"
+              ${checked ? "checked" : ""} ${disabled ? "disabled" : ""}
+              data-action="tmdb-toggle-screen">
+            ${safeText(s.name)}
+          </label>
+        `;
+      }).join("")}
+    </div>
+  `;
+}
+
+function renderTmdbQuickRun() {
+  const { genres, quickQuery, quickGenreId, quickIntervalMinutes, quickScreenIds, quickRun } = state.tmdb;
+  const tmdbAuto = state.project?.tmdbAuto;
+  const isActive = tmdbAuto?.enabled;
+  const isImporting = quickRun?.status === "running";
+  const isError = quickRun?.status === "error";
+
+  const genreOptions = genres.map(g =>
+    `<option value="${safeAttr(String(g.id))}" ${String(g.id) === (isActive ? String(quickGenreId) : quickGenreId) ? "selected" : ""}>${safeText(g.name)}</option>`
+  ).join("");
+
+  const effectiveScreenIds = quickScreenIds ?? (isActive ? (tmdbAuto.screenIds || []) : (state.project?.screens || []).filter(s => s.enabled).map(s => s.id));
+
+  const stepsList = quickRun?.steps ? `
+    <div class="tmdb-quick-steps">
+      ${quickRun.steps.map(s => `
+        <div class="tmdb-quick-step tmdb-quick-step--${s.status}">
+          <span class="tmdb-quick-step-dot"></span>
+          <span class="tmdb-quick-step-label">${safeText(s.label)}</span>
+          ${s.detail ? `<span class="tmdb-quick-step-detail">${safeText(s.detail)}</span>` : ""}
+        </div>
+      `).join("")}
+    </div>
+  ` : "";
+
+  if (isActive && !isImporting) {
+    const lastRotated = tmdbAuto.lastRotatedAt
+      ? `Last rotated ${formatRelativeTime(tmdbAuto.lastRotatedAt)}`
+      : "Not yet rotated";
+    return `
+      <div class="tmdb-quick-card tmdb-quick-card--active">
+        <div class="tmdb-quick-header">
+          <strong>Quick Automation <span class="tmdb-active-badge">Active</span></strong>
+          <span class="tmdb-quick-subtitle">${safeText(lastRotated)}</span>
+        </div>
+        <div class="tmdb-quick-section-label">Screens</div>
+        ${renderTmdbScreenPicker(effectiveScreenIds)}
+        <div class="tmdb-quick-fields">
+          <label class="tmdb-quick-field-label">Rotate every
+            <select id="tmdb-auto-interval" class="tmdb-select">
+              ${renderTmdbIntervalOptions(tmdbAuto.intervalMinutes)}
+            </select>
+          </label>
+          <button type="button" data-action="tmdb-force-next">Force Next</button>
+          <button type="button" class="secondary" data-action="tmdb-stop-auto">Stop</button>
+        </div>
+        <details class="tmdb-quick-rerun">
+          <summary>Change content</summary>
+          <div class="tmdb-quick-fields" style="margin-top:10px">
+            <input id="tmdb-quick-query" type="text" class="tmdb-query-input" placeholder="New search (e.g. horror, animated)…"
+              value="${safeAttr(quickQuery)}" autocomplete="off" spellcheck="false">
+            <select id="tmdb-quick-genre" class="tmdb-select">
+              <option value="">Any Genre</option>
+              ${genreOptions}
+            </select>
+            <button type="button" data-action="tmdb-quick-run">Re-import &amp; Restart</button>
+          </div>
+        </details>
+        ${stepsList}
+        ${isError ? `<p class="tmdb-error">${safeText(quickRun.error)}</p>` : ""}
+      </div>
+    `;
+  }
+
+  return `
+    <div class="tmdb-quick-card">
+      <div class="tmdb-quick-header">
+        <strong>Rotation Automation</strong>
+        <span class="tmdb-quick-subtitle">Search by keyword, genre, or studio. Posters are imported and rotated across your selected frames on a timer — each frame always shows a different movie.</span>
+      </div>
+      <div class="tmdb-quick-fields">
+        <input id="tmdb-quick-query" type="text" class="tmdb-query-input" placeholder="Keyword or studio — e.g. Pixar, animated, horror, kids…"
+          value="${safeAttr(quickQuery)}" autocomplete="off" spellcheck="false" ${isImporting ? "disabled" : ""}>
+        <select id="tmdb-quick-genre" class="tmdb-select" ${isImporting ? "disabled" : ""}>
+          <option value="">Any Genre</option>
+          ${genreOptions}
+        </select>
+      </div>
+      <div class="tmdb-quick-section-label">Screens</div>
+      ${renderTmdbScreenPicker(effectiveScreenIds, isImporting)}
+      <div class="tmdb-quick-fields">
+        <label class="tmdb-quick-field-label">Rotate every
+          <select id="tmdb-quick-interval" class="tmdb-select" ${isImporting ? "disabled" : ""}>
+            ${renderTmdbIntervalOptions(quickIntervalMinutes)}
+          </select>
+        </label>
+        <button type="button" data-action="tmdb-quick-run" ${isImporting ? "disabled" : ""}>${isImporting ? "Running…" : "Start"}</button>
+      </div>
+      ${stepsList}
+      ${quickRun?.status === "done" && quickRun.detail ? `<p class="tmdb-quick-done">${safeText(quickRun.detail)}</p>` : ""}
+      ${isError ? `<p class="tmdb-error">${safeText(quickRun.error)}</p>` : ""}
+    </div>
+  `;
+}
+
+function renderTmdbWorkspace() {
+  const { genres, query, genreId, sortBy, yearGte, yearLte, page, totalPages, results, loading, error, importing, importedNames } = state.tmdb;
+  const genreOptions = genres.map(g => `<option value="${safeAttr(String(g.id))}" ${String(g.id) === genreId ? "selected" : ""}>${safeText(g.name)}</option>`).join("");
+  const sortOptions = [
+    { v: "popularity.desc", l: "Most Popular" },
+    { v: "vote_average.desc", l: "Top Rated" },
+    { v: "primary_release_date.desc", l: "Newest" },
+    { v: "primary_release_date.asc", l: "Oldest" }
+  ].map(o => `<option value="${o.v}" ${sortBy === o.v ? "selected" : ""}>${o.l}</option>`).join("");
+  const cards = results.map(movie => {
+    const poster = movie.poster_path;
+    const year = movie.release_date ? movie.release_date.slice(0, 4) : "";
+    const imported = importedNames.some(n => n.includes(`tmdb-${movie.id}-`));
+    const isImporting = importing[movie.id];
+    return `
+      <div class="tmdb-movie-card">
+        <div class="tmdb-movie-poster">
+          ${poster ? `<img src="https://image.tmdb.org/t/p/w342${safeAttr(poster)}" alt="${safeAttr(movie.title)}" loading="lazy">` : `<div class="tmdb-no-poster">No Poster</div>`}
+        </div>
+        <div class="tmdb-movie-info">
+          <span class="tmdb-movie-title">${safeText(movie.title)}</span>
+          ${year ? `<span class="tmdb-movie-year">${safeText(year)}</span>` : ""}
+        </div>
+        <div class="tmdb-card-actions">
+          <button type="button" class="secondary tmdb-import-btn"
+            data-action="tmdb-import-movie"
+            data-movie-id="${safeAttr(String(movie.id))}"
+            data-poster-path="${safeAttr(poster || "")}"
+            data-title="${safeAttr(movie.title)}"
+            data-year="${safeAttr(year)}"
+            ${!poster ? "disabled" : ""}
+            ${isImporting ? "disabled" : ""}>
+            ${isImporting ? "…" : imported ? "✓ Saved" : "Import"}
+          </button>
+          ${imported ? `
+            <button type="button" class="tmdb-import-btn"
+              data-action="tmdb-open-in-content"
+              data-title="${safeAttr(movie.title)}">
+              Open
+            </button>
+          ` : `
+            <button type="button" class="tmdb-import-btn"
+              data-action="tmdb-import-and-open"
+              data-movie-id="${safeAttr(String(movie.id))}"
+              data-poster-path="${safeAttr(poster || "")}"
+              data-title="${safeAttr(movie.title)}"
+              data-year="${safeAttr(year)}"
+              ${!poster ? "disabled" : ""}
+              ${isImporting ? "disabled" : ""}>
+              Import &amp; Send
+            </button>
+          `}
+        </div>
+      </div>
+    `;
+  }).join("");
+  return `
+    <section class="studio-plugin-body tmdb-workspace">
+      ${renderTmdbQuickRun()}
+      <div class="tmdb-browse-card">
+        <div class="tmdb-browse-header">
+          <strong>Browse by Title</strong>
+          <span class="tmdb-quick-subtitle">Search for a specific movie to import its poster to your Content library.</span>
+        </div>
+        <div class="tmdb-search-bar">
+          <input id="tmdb-query" type="text" class="tmdb-query-input" placeholder="Movie title…"
+            value="${safeAttr(query)}" autocomplete="off" spellcheck="false">
+          <select id="tmdb-genre" class="tmdb-select">
+            <option value="">All Genres</option>
+            ${genreOptions}
+          </select>
+          <select id="tmdb-sort" class="tmdb-select">
+            ${sortOptions}
+          </select>
+          <div class="tmdb-year-range">
+            <input id="tmdb-year-gte" type="number" class="tmdb-year-input" placeholder="From" value="${safeAttr(yearGte)}" min="1900" max="2030">
+            <input id="tmdb-year-lte" type="number" class="tmdb-year-input" placeholder="To" value="${safeAttr(yearLte)}" min="1900" max="2030">
+          </div>
+          <button type="button" data-action="tmdb-search">Search</button>
+        </div>
+        ${error ? `<p class="tmdb-error">${safeText(error)}</p>` : ""}
+        ${loading ? `<div class="tmdb-loading">Searching…</div>` : ""}
+        ${!loading && results.length === 0 && !error ? `<div class="tmdb-empty">Search for a title to browse results.</div>` : ""}
+        ${results.length > 0 ? `
+          <div class="tmdb-results-grid">${cards}</div>
+          <div class="tmdb-pagination">
+            <button type="button" class="secondary" data-action="tmdb-prev-page" ${page <= 1 ? "disabled" : ""}>Previous</button>
+            <span class="tmdb-page-label">Page ${page} of ${totalPages}</span>
+            <button type="button" class="secondary" data-action="tmdb-next-page" ${page >= totalPages ? "disabled" : ""}>Next</button>
+          </div>
+        ` : ""}
+      </div>
+    </section>
+  `;
+}
+
 function renderPlaceholderPluginWorkspace(plugin, placeholder) {
   return `
     <section class="studio-plugin-body">
@@ -4018,6 +4507,7 @@ function createStudioWorkspacePanel() {
     helpers: {
       renderSpotifyPanel: createSpotifyPanel,
       renderAlbumArtWorkspace,
+      renderTmdbWorkspace,
       renderPlaceholderPluginWorkspace
     }
   }) || "";
@@ -4628,6 +5118,21 @@ function createContentEditModal() {
         </div>
         <form id="content-edit-form" class="content-edit-form" onsubmit="return false;">
           <fieldset class="content-edit-group">
+            <legend>Name</legend>
+            <label class="content-edit-name-label">
+              <input
+                id="content-edit-display-name"
+                type="text"
+                class="content-edit-name-input"
+                value="${safeAttr(image.displayName || image.name.replace(/^(\d+-)+/, "") || image.name)}"
+                placeholder="${safeAttr(image.name)}"
+                autocomplete="off"
+                spellcheck="false"
+              />
+            </label>
+            <p class="content-edit-group-copy content-edit-name-hint">${safeText(image.name)}</p>
+          </fieldset>
+          <fieldset class="content-edit-group">
             <legend>Frame Crop</legend>
             <div class="content-edit-mode-switch" role="tablist" aria-label="Crop mode">
               <button
@@ -4766,9 +5271,159 @@ function createContentEditModal() {
   `;
 }
 
+function createPlayPanel() {
+  const rooms = getGroupedScreens();
+  const collections = state.project.contentLibrary?.collections || [];
+  const np = state.ui.nowPlaying;
+
+  const collectionOptions = [
+    `<option value="all">All Images</option>`,
+    ...collections.map((c) => `<option value="${safeAttr(c.id)}">${safeText(c.name)}</option>`)
+  ].join("");
+
+  const intervalOptions = [
+    { value: "0", label: "Manual only" },
+    { value: "15", label: "Every 15 min" },
+    { value: "30", label: "Every 30 min" },
+    { value: "60", label: "Every hour" },
+    { value: "90", label: "Every 90 min" },
+    { value: "120", label: "Every 2 hours" },
+    { value: "240", label: "Every 4 hours" },
+    { value: "480", label: "Every 8 hours" },
+    { value: "1440", label: "Once a day" }
+  ].map(({ value, label }) => `<option value="${value}">${label}</option>`).join("");
+
+  const nowPlayingCard = np ? (() => {
+    const col = collections.find((c) => c.id === np.collectionId);
+    const colLabel = col ? col.name : np.collectionId === "all" ? "All Images" : np.collectionId;
+    const room = rooms.find((r) => r.id === np.roomId);
+    const roomLabel = room?.name || np.roomId;
+    const intervalLabel = np.intervalMinutes > 0 ? `rotating every ${np.intervalMinutes} min` : "manual rotation";
+    const endLabel = np.endAt ? `· Ends ${new Date(np.endAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}` : "";
+    return `
+      <div class="now-playing-card">
+        <div class="now-playing-info">
+          <span class="now-playing-badge">Now Playing</span>
+          <strong>${safeText(colLabel)}</strong>
+          <span>${safeText(roomLabel)} · ${intervalLabel}${endLabel ? " " + endLabel : ""}</span>
+        </div>
+        <div class="now-playing-actions">
+          <button type="button" class="secondary" data-action="advance-room" data-room-id="${safeAttr(np.roomId)}" title="Skip to next images">Next ${iconSvg("send")}</button>
+          <button type="button" class="secondary" data-action="dismiss-now-playing">Dismiss</button>
+        </div>
+      </div>
+    `;
+  })() : "";
+
+  const roomCards = rooms.map((room) => {
+    const config = state.project.ambient?.[room.id] || {};
+    const isEnabled = Boolean(config.enabled);
+    const isNowPlayingRoom = np?.roomId === room.id;
+    const screenCount = room.walls.flatMap((w) => w.screens).filter((s) => s.enabled).length;
+    const colLabel = (() => {
+      if (!config.collectionId || config.collectionId === "all") return "All Images";
+      const col = collections.find((c) => c.id === config.collectionId);
+      return col?.name || "All Images";
+    })();
+    const intervalLabel = config.intervalMinutes > 0 ? `every ${config.intervalMinutes} min` : "manual";
+    const statusLine = isNowPlayingRoom
+      ? `<span class="play-room-status play-room-status--playing">Now Playing override active</span>`
+      : isEnabled
+        ? `<span class="play-room-status play-room-status--active">Ambient · ${safeText(colLabel)} · ${intervalLabel}</span>`
+        : `<span class="play-room-status">Ambient not active</span>`;
+
+    return `
+      <div class="play-room-card ${isEnabled || isNowPlayingRoom ? "is-active" : ""}">
+        <div class="play-room-header">
+          <div class="play-room-title">
+            <strong>${safeText(room.name)}</strong>
+            <span>${screenCount} screen${screenCount !== 1 ? "s" : ""}</span>
+            ${statusLine}
+          </div>
+          <div class="play-room-header-actions">
+            ${isEnabled || isNowPlayingRoom ? `
+              <button type="button" class="icon-button icon-button--ghost" data-action="advance-room" data-room-id="${safeAttr(room.id)}" title="Advance to next images">
+                ${iconSvg("send")}
+              </button>
+            ` : ""}
+            <button type="button" class="secondary play-now-btn" data-action="open-play-now-dialog" data-room-id="${safeAttr(room.id)}">Play Now…</button>
+          </div>
+        </div>
+        <div class="play-ambient-config">
+          <label class="play-config-label">
+            <span>Source</span>
+            <select data-action="update-ambient-config" data-room-id="${safeAttr(room.id)}" data-field="collectionId">
+              ${collectionOptions.replace(`value="${safeAttr(config.collectionId || "all")}"`, `value="${safeAttr(config.collectionId || "all")}" selected`)}
+            </select>
+          </label>
+          <label class="play-config-label">
+            <span>Rotate</span>
+            <select data-action="update-ambient-config" data-room-id="${safeAttr(room.id)}" data-field="intervalMinutes">
+              ${intervalOptions.replace(`value="${config.intervalMinutes ?? 90}"`, `value="${config.intervalMinutes ?? 90}" selected`)}
+            </select>
+          </label>
+          <button
+            type="button"
+            class="${isEnabled ? "" : "secondary"} play-ambient-toggle"
+            data-action="toggle-ambient"
+            data-room-id="${safeAttr(room.id)}"
+          >${isEnabled ? "Pause Ambient" : "Activate Ambient"}</button>
+        </div>
+      </div>
+    `;
+  }).join("");
+
+  const dialog = state.ui.playNowDialog ? (() => {
+    const dlg = state.ui.playNowDialog;
+    const room = rooms.find((r) => r.id === dlg.roomId);
+    return `
+      <div class="send-picker-backdrop" data-action="close-play-now-dialog"></div>
+      <div class="send-picker" role="dialog" aria-label="Play now">
+        <div class="send-picker-header">
+          <span class="send-picker-title">Play Now · ${safeText(room?.name || dlg.roomId)}</span>
+          <button type="button" class="icon-button icon-button--ghost icon-button--small" data-action="close-play-now-dialog">${iconSvg("close")}</button>
+        </div>
+        <div class="send-picker-body">
+          <label class="play-config-label">
+            <span>Source</span>
+            <select id="play-now-collection">${collectionOptions.replace(`value="${safeAttr(dlg.collectionId || "all")}"`, `value="${safeAttr(dlg.collectionId || "all")}" selected`)}</select>
+          </label>
+          <label class="play-config-label" style="margin-top:8px">
+            <span>Rotate</span>
+            <select id="play-now-interval">${intervalOptions.replace(`value="${dlg.intervalMinutes ?? 90}"`, `value="${dlg.intervalMinutes ?? 90}" selected`)}</select>
+          </label>
+          <label class="play-config-label" style="margin-top:8px">
+            <span>End</span>
+            <select id="play-now-duration">
+              <option value="0" ${!dlg.durationMinutes ? "selected" : ""}>Until dismissed</option>
+              <option value="60" ${dlg.durationMinutes === 60 ? "selected" : ""}>1 hour</option>
+              <option value="120" ${dlg.durationMinutes === 120 ? "selected" : ""}>2 hours</option>
+              <option value="240" ${dlg.durationMinutes === 240 ? "selected" : ""}>4 hours</option>
+              <option value="360" ${dlg.durationMinutes === 360 ? "selected" : ""}>6 hours</option>
+            </select>
+          </label>
+        </div>
+        <div class="send-picker-footer">
+          <button type="button" class="secondary" data-action="close-play-now-dialog">Cancel</button>
+          <button type="button" data-action="confirm-play-now" data-room-id="${safeAttr(dlg.roomId)}">Start Playing</button>
+        </div>
+      </div>
+    `;
+  })() : "";
+
+  return `
+    <section class="play-panel">
+      ${nowPlayingCard}
+      <div class="play-rooms">
+        ${rooms.length ? roomCards : `<div class="empty-state empty-state--compact"><div><h2>No rooms configured</h2><p>Set up rooms and screens in Devices first.</p></div></div>`}
+      </div>
+      ${dialog}
+    </section>
+  `;
+}
+
 function createSectionPanel() {
   if (state.ui.section === "content") {
-    const selectedScreen = state.project.screens.find((screen) => screen.id === state.ui.contentScreenId);
     const visibleImages = getVisibleOutputImages();
     const isManageMode = state.ui.contentManageMode;
     return `
@@ -4779,9 +5434,7 @@ function createSectionPanel() {
             <p>${
               isManageMode
                 ? "Organize the content library. Collection tools are only visible here so browsing and sending stay simple."
-                : selectedScreen
-                  ? `Choose imagery for ${selectedScreen.name}.`
-                  : "Browse the library, open a collection if you want a themed view, and send something quickly."
+                : "Browse the library, open a collection, or send something quickly."
             }</p>
           </div>
           <div class="content-header-actions">
@@ -4799,12 +5452,6 @@ function createSectionPanel() {
         ${
           !isManageMode
             ? `
-              <div class="broadcast-row">
-                <span class="device-summary-kicker">Target Devices</span>
-                <div class="broadcast-grid">
-                  ${state.project.screens.filter((screen) => screen.enabled).map(createTargetDeviceButton).join("")}
-                </div>
-              </div>
               ${createContentBrowseCollectionsPanel()}
               ${createContentBrowseToolbar()}
             `
@@ -4817,6 +5464,10 @@ function createSectionPanel() {
         }
       </section>
     `;
+  }
+
+  if (state.ui.section === "play") {
+    return createPlayPanel();
   }
 
   if (state.ui.section === "studio") {
@@ -4934,6 +5585,8 @@ function renderWorkspace() {
         <input id="content-upload-input" type="file" accept=".jpg,.jpeg,.png,.webp,image/jpeg,image/png,image/webp" multiple hidden />
       </section>
       ${createPrimaryModal()}
+      ${createContentSendPicker()}
+      ${createContentCreateSetDialog()}
       ${createSendFlowOverlay()}
       ${createToastLayer()}
     </main>
@@ -5087,6 +5740,12 @@ function bindWorkspaceEvents() {
     element.addEventListener("change", handleFieldChange);
   });
 
+  app.querySelectorAll("[data-action='update-ambient-config']").forEach((el) => {
+    el.addEventListener("change", () => {
+      handleAction(el).catch(() => {});
+    });
+  });
+
   app.querySelectorAll("[data-action]").forEach((button) => {
     button.addEventListener("click", () => {
       handleAction(button).catch((error) => {
@@ -5098,6 +5757,37 @@ function bindWorkspaceEvents() {
         renderWorkspace();
       });
     });
+  });
+
+  const tmdbQuery = document.getElementById("tmdb-query");
+  if (tmdbQuery) {
+    tmdbQuery.addEventListener("input", (e) => { state.tmdb.query = e.target.value; });
+    tmdbQuery.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") { e.preventDefault(); app.querySelector('[data-action="tmdb-search"]')?.click(); }
+    });
+  }
+  document.getElementById("tmdb-genre")?.addEventListener("change", (e) => { state.tmdb.genreId = e.target.value; });
+  document.getElementById("tmdb-sort")?.addEventListener("change", (e) => { state.tmdb.sortBy = e.target.value; });
+  document.getElementById("tmdb-year-gte")?.addEventListener("change", (e) => { state.tmdb.yearGte = e.target.value; });
+  document.getElementById("tmdb-year-lte")?.addEventListener("change", (e) => { state.tmdb.yearLte = e.target.value; });
+
+  const tmdbQuickQuery = document.getElementById("tmdb-quick-query");
+  if (tmdbQuickQuery) {
+    tmdbQuickQuery.addEventListener("input", (e) => { state.tmdb.quickQuery = e.target.value; });
+    tmdbQuickQuery.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") { e.preventDefault(); app.querySelector('[data-action="tmdb-quick-run"]')?.click(); }
+    });
+  }
+  document.getElementById("tmdb-quick-genre")?.addEventListener("change", (e) => { state.tmdb.quickGenreId = e.target.value; });
+  document.getElementById("tmdb-quick-interval")?.addEventListener("change", (e) => { state.tmdb.quickIntervalMinutes = Number(e.target.value); });
+  document.getElementById("tmdb-auto-interval")?.addEventListener("change", (e) => {
+    if (state.project?.tmdbAuto) {
+      state.project.tmdbAuto.intervalMinutes = Number(e.target.value);
+      persistProject();
+    }
+  });
+  app.querySelectorAll(".tmdb-screen-checkbox").forEach((cb) => {
+    cb.addEventListener("change", () => handleAction(cb).catch(() => {}));
   });
 
   bindContentPressEvents();
@@ -5137,6 +5827,33 @@ function bindContentPressEvents() {
     card.addEventListener("pointercancel", clearTimer);
     card.addEventListener("contextmenu", (event) => event.preventDefault());
   });
+
+  app.querySelectorAll(".output-card-rename-input").forEach((input) => {
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        app.querySelector(`[data-action="save-content-rename"][data-image-name="${input.dataset.imageName}"]`)?.click();
+      }
+      if (event.key === "Escape") {
+        state.ui.contentRenameImage = "";
+        renderWorkspace();
+      }
+    });
+  });
+
+  const createSetInput = document.getElementById("create-set-name-input");
+  if (createSetInput) {
+    createSetInput.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        app.querySelector(`[data-action="confirm-create-set"]`)?.click();
+      }
+      if (event.key === "Escape") {
+        state.ui.contentCreateSetDialog = false;
+        renderWorkspace();
+      }
+    });
+  }
 }
 
 async function handleFieldChange(event) {
@@ -5340,6 +6057,12 @@ async function handleAction(button) {
     if (state.ui.studioPluginId === "album-art-generator") {
       await ensureAlbums(state.catalog.map((entry) => entry.slug));
     }
+    if (state.ui.studioPluginId === "movie-poster-studio" && !state.tmdb.genres.length) {
+      try {
+        const data = await apiGetJson("/api/tmdb/genres");
+        state.tmdb.genres = data.genres || [];
+      } catch {}
+    }
     state.actions.error = "";
     renderWorkspace();
     return;
@@ -5518,6 +6241,32 @@ async function handleAction(button) {
     return;
   }
 
+  if (action === "start-content-rename") {
+    const imageName = button.dataset.imageName || "";
+    if (!imageName) return;
+    state.ui.contentRenameImage = imageName;
+    renderWorkspace();
+    requestAnimationFrame(() => {
+      document.getElementById(`rename-input-${imageName}`)?.select();
+    });
+    return;
+  }
+
+  if (action === "save-content-rename") {
+    const imageName = button.dataset.imageName || "";
+    const input = document.getElementById(`rename-input-${imageName}`);
+    const displayName = input?.value?.trim() || "";
+    state.ui.contentRenameImage = "";
+    try {
+      await apiPatchJson(`/api/content/items/${encodeURIComponent(imageName)}/meta`, { displayName });
+      await refreshOutputImages({ render: false });
+    } catch (error) {
+      state.actions.error = error.message;
+    }
+    renderWorkspace();
+    return;
+  }
+
   if (action === "toggle-content-favorite") {
     const imageName = button.dataset.imageName || "";
     if (!imageName) {
@@ -5590,28 +6339,158 @@ async function handleAction(button) {
     return;
   }
 
-  if (action === "create-content-set") {
-    const input = document.getElementById("content-set-name");
+  if (action === "update-ambient-config") {
+    const roomId = button.dataset.roomId;
+    const field = button.dataset.field;
+    if (!roomId || !field) return;
+    state.project.ambient = state.project.ambient || {};
+    state.project.ambient[roomId] = normalizeAmbientConfig(state.project.ambient[roomId] || {});
+    if (field === "intervalMinutes") {
+      state.project.ambient[roomId].intervalMinutes = Number(button.value) || 0;
+    } else if (field === "collectionId") {
+      state.project.ambient[roomId].collectionId = button.value || "all";
+    }
+    persistProject();
+    return;
+  }
+
+  if (action === "toggle-ambient") {
+    const roomId = button.dataset.roomId;
+    if (!roomId) return;
+    state.project.ambient = state.project.ambient || {};
+    state.project.ambient[roomId] = normalizeAmbientConfig(state.project.ambient[roomId] || {});
+    const wasEnabled = state.project.ambient[roomId].enabled;
+    state.project.ambient[roomId].enabled = !wasEnabled;
+    if (!wasEnabled) {
+      state.project.ambient[roomId].lastRotatedAt = null;
+      startAmbientTimer();
+    }
+    persistProject();
+    renderWorkspace();
+    if (!wasEnabled) {
+      rotateRoom(roomId).then(({ sent, total }) => {
+        state.actions.notice = `Ambient active — rotated ${sent}/${total} screens.`;
+        renderWorkspace();
+      });
+    }
+    return;
+  }
+
+  if (action === "advance-room") {
+    const roomId = button.dataset.roomId;
+    if (!roomId) return;
+    button.disabled = true;
+    rotateRoom(roomId).then(({ sent, total }) => {
+      const ts = new Date().toISOString();
+      if (state.ui.nowPlaying?.roomId === roomId) {
+        state.ui.nowPlaying.lastRotatedAt = ts;
+      } else if (state.project.ambient?.[roomId]) {
+        state.project.ambient[roomId].lastRotatedAt = ts;
+        persistProject();
+      }
+      state.actions.notice = `Advanced — rotated ${sent}/${total} screens.`;
+      renderWorkspace();
+    });
+    return;
+  }
+
+  if (action === "open-play-now-dialog") {
+    const roomId = button.dataset.roomId;
+    if (!roomId) return;
+    const existing = state.project.ambient?.[roomId] || {};
+    state.ui.playNowDialog = {
+      roomId,
+      collectionId: existing.collectionId || "all",
+      intervalMinutes: existing.intervalMinutes ?? 90,
+      durationMinutes: 0
+    };
+    renderWorkspace();
+    return;
+  }
+
+  if (action === "close-play-now-dialog") {
+    state.ui.playNowDialog = null;
+    renderWorkspace();
+    return;
+  }
+
+  if (action === "confirm-play-now") {
+    const roomId = button.dataset.roomId;
+    if (!roomId) return;
+    const collectionId = document.getElementById("play-now-collection")?.value || "all";
+    const intervalMinutes = Number(document.getElementById("play-now-interval")?.value) || 0;
+    const durationMinutes = Number(document.getElementById("play-now-duration")?.value) || 0;
+    const snapshotImages = {};
+    getScreensForRoom(roomId).forEach((s) => {
+      if (state.ui.screenImages[s.id]) snapshotImages[s.id] = state.ui.screenImages[s.id];
+    });
+    state.ui.nowPlaying = {
+      roomId,
+      collectionId,
+      intervalMinutes,
+      endAt: durationMinutes > 0 ? new Date(Date.now() + durationMinutes * 60_000).toISOString() : null,
+      lastRotatedAt: null,
+      snapshotImages
+    };
+    state.ui.playNowDialog = null;
+    if (intervalMinutes > 0) startAmbientTimer();
+    renderWorkspace();
+    rotateRoom(roomId).then(({ sent, total }) => {
+      state.ui.nowPlaying && (state.ui.nowPlaying.lastRotatedAt = new Date().toISOString());
+      state.actions.notice = `Now Playing started — ${sent}/${total} screens updated.`;
+      renderWorkspace();
+    });
+    return;
+  }
+
+  if (action === "dismiss-now-playing") {
+    endNowPlaying();
+    return;
+  }
+
+  if (action === "open-create-set-dialog") {
+    if (state.ui.contentManageSelections.length < 2) {
+      state.actions.error = "Select at least 2 images first.";
+      renderWorkspace();
+      return;
+    }
+    state.ui.contentCreateSetDialog = true;
+    renderWorkspace();
+    requestAnimationFrame(() => {
+      document.getElementById("create-set-name-input")?.focus();
+    });
+    return;
+  }
+
+  if (action === "cancel-create-set-dialog") {
+    state.ui.contentCreateSetDialog = false;
+    renderWorkspace();
+    return;
+  }
+
+  if (action === "confirm-create-set") {
+    const input = document.getElementById("create-set-name-input");
     const rawName = input?.value?.trim() || "";
     if (!rawName) {
-      state.actions.error = "Enter a set name first.";
-      renderWorkspace();
+      input?.select();
       return;
     }
     const selection = [...state.ui.contentManageSelections];
     if (selection.length < 2) {
       state.actions.error = "Select at least 2 images in the order you want them assigned to frames.";
+      state.ui.contentCreateSetDialog = false;
       renderWorkspace();
       return;
     }
     const set = createContentSet(rawName, selection);
     if (!set) {
       state.actions.error = "Could not create set.";
+      state.ui.contentCreateSetDialog = false;
       renderWorkspace();
       return;
     }
     persistProject();
-    if (input) input.value = "";
+    state.ui.contentCreateSetDialog = false;
     state.ui.contentManageSelections = [];
     state.ui.contentSetEditorId = set.id;
     state.ui.modal = "content-set-editor";
@@ -6147,6 +7026,285 @@ async function handleAction(button) {
     return;
   }
 
+  if (action === "tmdb-search") {
+    state.tmdb.page = 1;
+    state.tmdb.loading = true;
+    state.tmdb.error = "";
+    renderWorkspace();
+    try {
+      const params = new URLSearchParams({ page: 1, sort_by: state.tmdb.sortBy });
+      if (state.tmdb.query) params.set("query", state.tmdb.query);
+      if (state.tmdb.genreId) params.set("genre_id", state.tmdb.genreId);
+      if (state.tmdb.yearGte) params.set("year_gte", state.tmdb.yearGte);
+      if (state.tmdb.yearLte) params.set("year_lte", state.tmdb.yearLte);
+      const data = await apiGetJson(`/api/tmdb/movies?${params}`);
+      state.tmdb.results = data.results || [];
+      state.tmdb.totalPages = Math.min(data.total_pages || 1, 500);
+    } catch (error) {
+      state.tmdb.error = error.message;
+    }
+    state.tmdb.loading = false;
+    renderWorkspace();
+    return;
+  }
+
+  if (action === "tmdb-prev-page") {
+    if (state.tmdb.page <= 1) return;
+    state.tmdb.page--;
+    await handleAction({ dataset: { action: "_tmdb-load-page" } });
+    return;
+  }
+
+  if (action === "tmdb-next-page") {
+    if (state.tmdb.page >= state.tmdb.totalPages) return;
+    state.tmdb.page++;
+    await handleAction({ dataset: { action: "_tmdb-load-page" } });
+    return;
+  }
+
+  if (action === "_tmdb-load-page") {
+    state.tmdb.loading = true;
+    state.tmdb.error = "";
+    renderWorkspace();
+    try {
+      const params = new URLSearchParams({ page: state.tmdb.page, sort_by: state.tmdb.sortBy });
+      if (state.tmdb.query) params.set("query", state.tmdb.query);
+      if (state.tmdb.genreId) params.set("genre_id", state.tmdb.genreId);
+      if (state.tmdb.yearGte) params.set("year_gte", state.tmdb.yearGte);
+      if (state.tmdb.yearLte) params.set("year_lte", state.tmdb.yearLte);
+      const data = await apiGetJson(`/api/tmdb/movies?${params}`);
+      state.tmdb.results = data.results || [];
+      state.tmdb.totalPages = Math.min(data.total_pages || 1, 500);
+    } catch (error) {
+      state.tmdb.error = error.message;
+    }
+    state.tmdb.loading = false;
+    renderWorkspace();
+    return;
+  }
+
+  if (action === "tmdb-import-movie") {
+    const movieId = button.dataset.movieId || "";
+    const posterPath = button.dataset.posterPath || "";
+    const title = button.dataset.title || "";
+    const year = button.dataset.year || "";
+    if (!posterPath) return;
+    state.tmdb.importing = { ...state.tmdb.importing, [movieId]: true };
+    renderWorkspace();
+    try {
+      const payload = await apiPostJson("/api/tmdb/import", { posterPath, title, year, movieId });
+      if (payload.ok && payload.filename) {
+        state.tmdb.importedNames = [...state.tmdb.importedNames, payload.filename];
+        const outputPayload = await loadOutputImages();
+        state.outputImages = outputPayload.images || [];
+        state.actions.notice = `Imported "${title}" poster.`;
+        state.actions.error = "";
+      }
+    } catch (error) {
+      state.tmdb.error = `Import failed: ${error.message}`;
+    }
+    state.tmdb.importing = { ...state.tmdb.importing, [movieId]: false };
+    renderWorkspace();
+    return;
+  }
+
+  if (action === "tmdb-open-in-content") {
+    const title = button.dataset.title || "";
+    const match = state.outputImages.find((img) =>
+      (img.displayName || img.name).toLowerCase().includes(title.toLowerCase().slice(0, 12))
+    ) || state.outputImages.find((img) => state.tmdb.importedNames.some((n) => img.name === n));
+    state.ui.section = "content";
+    state.ui.contentSelectedImage = match?.name || "";
+    state.ui.contentScreenId = null;
+    state.ui.contentBroadcastIds = [];
+    state.ui.contentManageMode = false;
+    state.ui.contentManageSelections = [];
+    state.actions.error = "";
+    renderWorkspace();
+    return;
+  }
+
+  if (action === "tmdb-import-and-open") {
+    const movieId = button.dataset.movieId || "";
+    const posterPath = button.dataset.posterPath || "";
+    const title = button.dataset.title || "";
+    const year = button.dataset.year || "";
+    if (!posterPath) return;
+    state.tmdb.importing = { ...state.tmdb.importing, [movieId]: true };
+    renderWorkspace();
+    let filename = null;
+    try {
+      const payload = await apiPostJson("/api/tmdb/import", { posterPath, title, year, movieId });
+      if (payload.ok && payload.filename) {
+        filename = payload.filename;
+        state.tmdb.importedNames = [...state.tmdb.importedNames, filename];
+        const outputPayload = await loadOutputImages();
+        state.outputImages = outputPayload.images || [];
+        state.actions.error = "";
+      }
+    } catch (error) {
+      state.tmdb.error = `Import failed: ${error.message}`;
+    }
+    state.tmdb.importing = { ...state.tmdb.importing, [movieId]: false };
+    if (filename) {
+      state.ui.section = "content";
+      state.ui.contentSelectedImage = filename;
+      state.ui.contentSendPickerImage = filename;
+      state.ui.contentScreenId = null;
+      state.ui.contentBroadcastIds = [];
+      state.ui.contentManageMode = false;
+      state.ui.contentManageSelections = [];
+    }
+    renderWorkspace();
+    return;
+  }
+
+  if (action === "tmdb-toggle-screen") {
+    const screenId = button.dataset.screenId || "";
+    if (!screenId) return;
+    const current = state.tmdb.quickScreenIds ?? (state.project?.tmdbAuto?.screenIds || []);
+    const next = new Set(current);
+    if (next.has(screenId)) { next.delete(screenId); } else { next.add(screenId); }
+    state.tmdb.quickScreenIds = [...next];
+    if (state.project?.tmdbAuto?.enabled) {
+      state.project.tmdbAuto.screenIds = [...next];
+      persistProject();
+    }
+    renderWorkspace();
+    return;
+  }
+
+  if (action === "tmdb-force-next") {
+    const result = await rotateTmdbAuto();
+    state.project.tmdbAuto.lastRotatedAt = new Date().toISOString();
+    persistProject();
+    state.actions.notice = `Rotated — ${result.sent}/${result.total} frames updated.`;
+    renderWorkspace();
+    return;
+  }
+
+  if (action === "tmdb-stop-auto") {
+    state.project.tmdbAuto.enabled = false;
+    persistProject();
+    state.tmdb.quickRun = null;
+    state.tmdb.quickScreenIds = null;
+    renderWorkspace();
+    return;
+  }
+
+  if (action === "tmdb-quick-run") {
+    const query = state.tmdb.quickQuery.trim();
+    const genreId = state.tmdb.quickGenreId;
+    const intervalMinutes = state.project?.tmdbAuto?.enabled
+      ? (state.project.tmdbAuto.intervalMinutes || 60)
+      : (state.tmdb.quickIntervalMinutes || 60);
+    if (!query && !genreId) {
+      state.tmdb.quickRun = { status: "error", steps: [], error: "Enter a search term or pick a genre." };
+      renderWorkspace();
+      return;
+    }
+    const selectedScreenIds = state.tmdb.quickScreenIds ?? (state.project?.tmdbAuto?.screenIds?.length
+      ? state.project.tmdbAuto.screenIds
+      : (state.project?.screens || []).filter((s) => s.enabled).map((s) => s.id));
+    const targetScreens = (state.project?.screens || []).filter((s) => s.enabled && selectedScreenIds.includes(s.id));
+    if (!targetScreens.length) {
+      state.tmdb.quickRun = { status: "error", steps: [], error: "Select at least one frame." };
+      renderWorkspace();
+      return;
+    }
+
+    const mkStep = (label) => ({ label, status: "idle", detail: "" });
+    const steps = [mkStep("Search TMDB"), mkStep("Import posters"), mkStep("Set up rotation"), mkStep("Send initial rotation")];
+    const setStep = (index, status, detail = "") => {
+      steps[index] = { ...steps[index], status, detail };
+      state.tmdb.quickRun = { status: "running", steps: [...steps], error: "" };
+      renderWorkspace();
+    };
+
+    state.tmdb.quickRun = { status: "running", steps: [...steps], error: "" };
+    renderWorkspace();
+
+    try {
+      setStep(0, "running");
+      const poolSize = Math.max(targetScreens.length * 3, 20);
+      const movieSet = new Map();
+      for (let p = 1; p <= Math.min(Math.ceil(poolSize / 20), 3); p++) {
+        const params = new URLSearchParams({ page: p, sort_by: "popularity.desc" });
+        if (query) params.set("query", query);
+        if (genreId) params.set("genre_id", genreId);
+        const data = await apiGetJson(`/api/tmdb/discover?${params}`);
+        (data.results || []).forEach((m) => { if (m.poster_path) movieSet.set(m.id, m); });
+        if (!data.results?.length) break;
+      }
+      const movies = [...movieSet.values()].slice(0, poolSize);
+      if (!movies.length) throw new Error("No results found. Try a different keyword, or pick a genre from the dropdown.");
+      if (movies.length < targetScreens.length) throw new Error(`Only ${movies.length} movie${movies.length === 1 ? "" : "s"} found — need at least ${targetScreens.length} (one per frame). Try a broader search or pick a genre.`);
+      setStep(0, "done", `${movies.length} movies found`);
+
+      setStep(1, "running");
+      const TMDB_COLLECTION_ID = "tmdb-auto";
+      const imported = [];
+      for (const movie of movies) {
+        try {
+          const year = movie.release_date ? movie.release_date.slice(0, 4) : "";
+          const payload = await apiPostJson("/api/tmdb/import", {
+            posterPath: movie.poster_path, title: movie.title, year, movieId: String(movie.id)
+          });
+          if (payload.ok && payload.filename) imported.push(payload.filename);
+        } catch {}
+        setStep(1, "running", `${imported.length} / ${movies.length}`);
+      }
+      if (!imported.length) throw new Error("No posters could be imported.");
+      setStep(1, "done", `${imported.length} posters imported`);
+
+      setStep(2, "running");
+      state.project.contentLibrary = state.project.contentLibrary || { collections: [], sets: [], items: {} };
+      state.project.contentLibrary.collections = state.project.contentLibrary.collections || [];
+      if (!state.project.contentLibrary.collections.find((c) => c.id === TMDB_COLLECTION_ID)) {
+        state.project.contentLibrary.collections.push({ id: TMDB_COLLECTION_ID, name: "TMDB Auto" });
+      }
+      state.project.contentLibrary.items = state.project.contentLibrary.items || {};
+      for (const filename of imported) {
+        const existing = state.project.contentLibrary.items[filename] || { tags: [], collectionIds: [] };
+        const ids = new Set(existing.collectionIds || []);
+        ids.add(TMDB_COLLECTION_ID);
+        state.project.contentLibrary.items[filename] = { ...existing, collectionIds: [...ids] };
+      }
+      state.project.tmdbAuto = {
+        screenIds: targetScreens.map((s) => s.id),
+        intervalMinutes,
+        enabled: true,
+        lastRotatedAt: null
+      };
+      persistProject();
+      const outputPayload = await loadOutputImages();
+      state.outputImages = outputPayload.images || [];
+      state.tmdb.quickScreenIds = null;
+      startAmbientTimer();
+      setStep(2, "done", `Rotating every ${intervalMinutes >= 60 ? `${intervalMinutes / 60}h` : `${intervalMinutes}min`}`);
+
+      setStep(3, "running");
+      const result = await rotateTmdbAuto();
+      state.project.tmdbAuto.lastRotatedAt = new Date().toISOString();
+      persistProject();
+      setStep(3, "done", `${result.sent}/${result.total} frames updated`);
+
+      const n = targetScreens.length;
+      state.tmdb.quickRun = {
+        status: "done", steps: [...steps], error: "",
+        detail: `${imported.length} posters rotating every ${intervalMinutes >= 60 ? `${intervalMinutes / 60}h` : `${intervalMinutes}min`} across ${n} frame${n === 1 ? "" : "s"}.`
+      };
+      state.actions.notice = "TMDB automation started.";
+      state.actions.error = "";
+    } catch (error) {
+      const failedIndex = steps.findIndex((s) => s.status === "running");
+      if (failedIndex >= 0) steps[failedIndex] = { ...steps[failedIndex], status: "error" };
+      state.tmdb.quickRun = { status: "error", steps: [...steps], error: error.message };
+    }
+    renderWorkspace();
+    return;
+  }
+
   if (action === "open-generated-content") {
     const firstGenerated = state.studio.albumArt.generatedImageNames[0] || "";
     state.ui.section = "content";
@@ -6339,10 +7497,18 @@ async function handleAction(button) {
     renderWorkspace();
     try {
       const encodedName = encodeURIComponent(state.ui.contentEdit.imageName);
-      const payload = await apiPutJson(`/api/content/items/${encodedName}/edit`, {
-        editRecipe: state.ui.contentEdit.draft,
-        saveAsCopy
-      });
+      const displayNameInput = document.getElementById("content-edit-display-name");
+      const newDisplayName = displayNameInput?.value?.trim() ?? null;
+      const currentDisplayName = getContentImageMeta(state.ui.contentEdit.imageName).displayName || "";
+      const [payload] = await Promise.all([
+        apiPutJson(`/api/content/items/${encodedName}/edit`, {
+          editRecipe: state.ui.contentEdit.draft,
+          saveAsCopy
+        }),
+        newDisplayName !== null && newDisplayName !== currentDisplayName
+          ? apiPatchJson(`/api/content/items/${encodedName}/meta`, { displayName: newDisplayName })
+          : Promise.resolve()
+      ]);
       const outputPayload = await loadOutputImages();
       state.outputImages = outputPayload.images || [];
       if (!saveAsCopy) {
@@ -6425,6 +7591,64 @@ async function handleAction(button) {
       const payload = await apiPostJson("/api/content/send", {
         imageName: selectedImage.name,
         screenIds: targetIds
+      });
+      state.ui.sendFlow.jobId = payload.jobId;
+      state.ui.sendFlow.status = "running";
+      await pollSendFlowJob(payload.jobId, { immediate: true });
+    } catch (error) {
+      state.actions.error = error.message;
+      stopSendFlowPolling();
+      state.ui.sendFlow = {
+        ...(state.ui.sendFlow || {}),
+        active: true,
+        status: "failed",
+        error: error.message,
+        progress: 12,
+        steps: (state.ui.sendFlow?.steps || []).map((step, index) => ({
+          ...step,
+          state: index === 0 ? "error" : "pending"
+        }))
+      };
+    }
+    renderWorkspace();
+    return;
+  }
+
+  if (action === "open-content-send-picker") {
+    const imageName = button.dataset.imageName || state.ui.contentSelectedImage;
+    if (imageName) {
+      state.ui.contentSendPickerImage = imageName;
+      renderWorkspace();
+    }
+    return;
+  }
+
+  if (action === "close-content-send-picker") {
+    state.ui.contentSendPickerImage = "";
+    renderWorkspace();
+    return;
+  }
+
+  if (action === "send-content-to-screen") {
+    const imageName = button.dataset.imageName;
+    const screenId = button.dataset.screenId;
+    const screen = state.project.screens.find((s) => s.id === screenId);
+    const image = state.outputImages.find((img) => img.name === imageName);
+    if (!image || !screen) {
+      state.actions.error = "Could not find image or screen.";
+      renderWorkspace();
+      return;
+    }
+    state.ui.contentSendPickerImage = "";
+    state.ui.sendFlow = createPendingSendFlow({
+      imageName: image.name,
+      targetNames: [screen.name]
+    });
+    renderWorkspace();
+    try {
+      const payload = await apiPostJson("/api/content/send", {
+        imageName: image.name,
+        screenIds: [screen.id]
       });
       state.ui.sendFlow.jobId = payload.jobId;
       state.ui.sendFlow.status = "running";

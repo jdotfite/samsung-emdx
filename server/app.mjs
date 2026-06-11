@@ -1302,6 +1302,155 @@ export async function startAppServer({ host = env.appHost, port = env.appPort } 
     }
   });
 
+  app.patch("/api/content/items/:imageName/meta", async (req, res) => {
+    try {
+      const imageName = String(req.params.imageName || "").trim();
+      if (!imageName || path.basename(imageName) !== imageName) {
+        res.status(400).json({ error: "Invalid image name." });
+        return;
+      }
+      const { displayName } = req.body || {};
+      const project = loadProjectFromStore();
+      project.contentLibrary = project.contentLibrary || { collections: [], sets: [], items: {} };
+      project.contentLibrary.items = project.contentLibrary.items || {};
+      project.contentLibrary.items[imageName] = project.contentLibrary.items[imageName] || { tags: [], collectionIds: [] };
+      if (displayName !== undefined) {
+        const trimmed = String(displayName).trim();
+        project.contentLibrary.items[imageName].displayName = trimmed || null;
+      }
+      saveProjectToStore(project);
+      res.json({ ok: true });
+    } catch (error) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  const TMDB_GENRE_KEYWORDS = {
+    action: 28, adventure: 12, animated: 16, animation: 16, cartoon: 16, anime: 16,
+    comedy: 35, funny: 35, humor: 35, crime: 80, documentary: 99, doc: 99,
+    drama: 18, family: 10751, kids: 10751, children: 10751,
+    "kids movies": 10751, "kids movie": 10751, "family movie": 10751, "family movies": 10751,
+    "children's": 10751, fantasy: 14, historical: 36, history: 36,
+    horror: 27, scary: 27, "sci-fi": 878, scifi: 878, "science fiction": 878,
+    thriller: 53, mystery: 9648, romance: 10749, romantic: 10749,
+    music: 10402, musical: 10402, war: 10752, western: 37
+  };
+
+  app.get("/api/tmdb/discover", async (req, res) => {
+    if (!env.tmdbReadAccessToken) { res.status(503).json({ error: "TMDB not configured." }); return; }
+    try {
+      const { query, genre_id, sort_by = "popularity.desc", page = 1, year_gte, year_lte } = req.query;
+      const headers = { Authorization: `Bearer ${env.tmdbReadAccessToken}` };
+      let withKeywords = "";
+      let withCompanies = "";
+      let resolvedGenreId = genre_id || "";
+
+      if (query) {
+        const queryLower = query.trim().toLowerCase();
+        const genreMatch = TMDB_GENRE_KEYWORDS[queryLower];
+        if (genreMatch && !genre_id) {
+          resolvedGenreId = String(genreMatch);
+        } else {
+          const [kwRes, coRes] = await Promise.allSettled([
+            fetch(`https://api.themoviedb.org/3/search/keyword?query=${encodeURIComponent(query)}&page=1`, { headers }).then(r => r.json()),
+            fetch(`https://api.themoviedb.org/3/search/company?query=${encodeURIComponent(query)}&page=1`, { headers }).then(r => r.json())
+          ]);
+          const companies = coRes.status === "fulfilled" ? (coRes.value.results || []).slice(0, 3) : [];
+          const keywords = kwRes.status === "fulfilled" ? (kwRes.value.results || []).slice(0, 8) : [];
+          const matchedCompanies = companies.filter(c => {
+            const n = c.name.toLowerCase();
+            const words = n.split(/\s+/);
+            return (n.includes(queryLower) || queryLower.includes(n) || words.some(w => w.length >= 4 && queryLower.includes(w))) && n.length >= 4;
+          });
+          if (matchedCompanies.length) {
+            withCompanies = matchedCompanies.map(c => c.id).join("|");
+          } else if (keywords.length) {
+            withKeywords = keywords.map(k => k.id).join("|");
+          }
+        }
+      }
+
+      if (query && !resolvedGenreId && !withKeywords && !withCompanies) {
+        const r = await fetch(`https://api.themoviedb.org/3/search/movie?query=${encodeURIComponent(query)}&page=${page}&include_adult=false`, { headers });
+        res.json(await r.json());
+        return;
+      }
+
+      let discoverUrl = `https://api.themoviedb.org/3/discover/movie?sort_by=${encodeURIComponent(sort_by)}&page=${page}&include_adult=false`;
+      if (resolvedGenreId) discoverUrl += `&with_genres=${resolvedGenreId}`;
+      if (withKeywords) discoverUrl += `&with_keywords=${withKeywords}`;
+      if (withCompanies) discoverUrl += `&with_companies=${withCompanies}`;
+      if (year_gte) discoverUrl += `&primary_release_date.gte=${year_gte}-01-01`;
+      if (year_lte) discoverUrl += `&primary_release_date.lte=${year_lte}-12-31`;
+      const r = await fetch(discoverUrl, { headers });
+      res.json(await r.json());
+    } catch (error) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.get("/api/tmdb/genres", async (req, res) => {
+    if (!env.tmdbReadAccessToken) { res.status(503).json({ error: "TMDB not configured." }); return; }
+    try {
+      const r = await fetch("https://api.themoviedb.org/3/genre/movie/list?language=en", {
+        headers: { Authorization: `Bearer ${env.tmdbReadAccessToken}` }
+      });
+      res.json(await r.json());
+    } catch (error) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.get("/api/tmdb/movies", async (req, res) => {
+    if (!env.tmdbReadAccessToken) { res.status(503).json({ error: "TMDB not configured." }); return; }
+    try {
+      const { query, genre_id, sort_by = "popularity.desc", page = 1, year_gte, year_lte } = req.query;
+      let url;
+      if (query) {
+        url = `https://api.themoviedb.org/3/search/movie?query=${encodeURIComponent(query)}&page=${page}&include_adult=false`;
+      } else {
+        const params = new URLSearchParams({ sort_by, page, include_adult: "false" });
+        if (genre_id) params.set("with_genres", genre_id);
+        if (year_gte) params.set("primary_release_date.gte", `${year_gte}-01-01`);
+        if (year_lte) params.set("primary_release_date.lte", `${year_lte}-12-31`);
+        url = `https://api.themoviedb.org/3/discover/movie?${params}`;
+      }
+      const r = await fetch(url, { headers: { Authorization: `Bearer ${env.tmdbReadAccessToken}` } });
+      res.json(await r.json());
+    } catch (error) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.post("/api/tmdb/import", async (req, res) => {
+    if (!env.tmdbReadAccessToken) { res.status(503).json({ error: "TMDB not configured." }); return; }
+    try {
+      const { posterPath, title, year, movieId } = req.body || {};
+      if (!posterPath || typeof posterPath !== "string" || !posterPath.startsWith("/")) {
+        res.status(400).json({ error: "Invalid posterPath." }); return;
+      }
+      const imageUrl = `https://image.tmdb.org/t/p/original${posterPath}`;
+      const imgRes = await fetch(imageUrl, { headers: { Authorization: `Bearer ${env.tmdbReadAccessToken}` } });
+      if (!imgRes.ok) { res.status(502).json({ error: `TMDB image fetch failed: ${imgRes.status}` }); return; }
+      const buffer = Buffer.from(await imgRes.arrayBuffer());
+      const slug = [
+        "tmdb",
+        movieId ? String(movieId) : "",
+        (title || "poster").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, ""),
+        year ? String(year) : ""
+      ].filter(Boolean).join("-");
+      const filename = `${Date.now()}-${slug}.jpg`;
+      const outPath = path.join(env.outputDir, filename);
+      await sharp(buffer)
+        .resize(1440, 2560, { fit: "cover", position: "center" })
+        .jpeg({ quality: 92 })
+        .toFile(outPath);
+      res.json({ ok: true, filename });
+    } catch (error) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
   app.post("/api/content/send", async (req, res) => {
     try {
       const project = loadProjectFromStore();

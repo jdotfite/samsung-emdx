@@ -23,7 +23,8 @@ export const env = {
   defaultLocalIp: process.env.DEFAULT_LOCAL_IP || "",
   samsungEmdxBin: process.env.SAMSUNG_EMDX_BIN || "",
   appAuthToken: process.env.APP_AUTH_TOKEN || "",
-  contentSchedulePollMs: toPositiveNumber(process.env.CONTENT_SCHEDULE_POLL_MS, 30000)
+  contentSchedulePollMs: toPositiveNumber(process.env.CONTENT_SCHEDULE_POLL_MS, 30000),
+  tmdbReadAccessToken: process.env.TMDB_READ_ACCESS_TOKEN || ""
 };
 
 export function requireSpotifyConfig() {

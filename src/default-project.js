@@ -7,6 +7,7 @@ export const DEFAULT_PROJECT = {
   walls: [
     { id: "living-room-living-room-wall", roomId: "living-room", name: "Living Room Wall" }
   ],
+  ambient: {},
   contentLibrary: {
     collections: [],
     sets: [],
